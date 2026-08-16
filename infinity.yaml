@@ -816,6 +816,7 @@ text:
     mode: text
     optimistic: true
     restore_value: true
+    entity_category: config
     min_length: 7
     max_length: 7
     initial_value: '#FF0000'
@@ -827,6 +828,7 @@ text:
     mode: text
     optimistic: true
     restore_value: true
+    entity_category: config
     min_length: 7
     max_length: 7
     initial_value: '#00FF00'
@@ -838,6 +840,7 @@ text:
     mode: text
     optimistic: true
     restore_value: true
+    entity_category: config
     min_length: 7
     max_length: 7
     initial_value: '#0000FF'
@@ -939,10 +942,10 @@ select:
     options:
       - "Off"
       - "Time"
-      - "Fire"
-      - "Alarm"
       - "Sun"
       - "Moon"
+      - "Alarm"
+      - "Fire"
       - "Rainbow"
       - "Color Wipe"
       - "Scan"
@@ -1543,58 +1546,176 @@ light:
       #
       - addressable_lambda:
           name: Moon
-          # the phase moves once a day; 1s is already far more often than needed
-          update_interval: 1s
+          # The moon moves about half a degree an hour, and the arc changes by
+          # roughly two pixels a day. 10s matches the Sun effect and keeps the
+          # heaviest maths in this config off the hot path.
+          update_interval: 10s
           lambda: |-
             auto time = id(sntp_time).now();
 
+            // Blank rather than bare return: without a clock there is nothing
+            // to draw, and leaving the previous effect's pixels standing would
+            // be worse than darkness.
             if (!time.is_valid()) {
+              for (int j = 0; j < it.size(); j++) {
+                it[j] = Color(0, 0, 0);
+              }
               return;
             }
 
-            // The renderer below wants "days into the lunar cycle", 0..29. The
-            // original computed that with integer arithmetic on the raw epoch:
-            // "(timestamp - 518400) % 2551443 / 86400". Two things were wrong
-            // with it - 518400 (6 days) is not a new moon reference, and
-            // 2551443 seconds is the synodic month, so the modulo left seconds
-            // into the cycle and the division by a day gave 0..29 only by
-            // accident of the wrong epoch. It tracked nothing in the sky.
-            //
-            // Reference new moon: 2000-01-06 18:14 UTC, the standard epoch for
-            // this calculation. The synodic month is 29.530588853 days.
-            constexpr double SYNODIC_MONTH_DAYS = 29.530588853;
-            constexpr double REFERENCE_NEW_MOON = 947182440.0;
+            // Same coordinate parsing as the Sun effect. Duplicated rather
+            // than shared because ESPHome lambdas have no common scope for a
+            // helper - the alternative would be a global, which is worse.
+            auto parseCoord = [](const std::string &s, float fallback, float limit) -> float {
+              if (s.empty()) {
+                return fallback;
+              }
+              char *end = nullptr;
+              const float v = strtof(s.c_str(), &end);
+              if (end == s.c_str() || !std::isfinite(v) || v < -limit || v > limit) {
+                return fallback;
+              }
+              return v;
+            };
 
-            const double days = (time.timestamp - REFERENCE_NEW_MOON) / 86400.0;
-            double cycles = days / SYNODIC_MONTH_DAYS;
-            cycles -= std::floor(cycles);
+            const double obsLat = parseCoord(id(latitude_text_id).state, ${DEFAULT_LATITUDE}f, 90.0f);
+            const double obsLon = parseCoord(id(longitude_text_id).state, ${DEFAULT_LONGITUDE}f, 180.0f);
 
-            // Illuminated fraction of the disc: 0 at new moon, 1 at full. The
-            // ring shows exactly that fraction of itself, so full moon is a
-            // closed circle and new moon is dark.
-            //
-            // This replaces a triangular approximation - "(14 - |14 - phase|)"
-            // scaled to the ring, minus a sixth - which grew the crescent at a
-            // constant rate and, worse, never reached zero: its fade-in edge did
-            // not depend on the phase at all, so ten pixels stayed lit at every
-            // phase including new moon. The cosine is both shorter and correct:
-            // the moon changes slowly around new and full and quickly around the
-            // quarters, which is what you actually see in the sky.
-            constexpr float TWO_PI_F = 6.283185307179586f;
-            const float illuminated = (1.0f - std::cos(TWO_PI_F * (float) cycles)) / 2.0f;
+            constexpr double DEG = 0.017453292519943295;
+            constexpr double RAD = 57.29577951308232;
+
+            auto sind = [DEG](double a) { return std::sin(a * DEG); };
+            auto cosd = [DEG](double a) { return std::cos(a * DEG); };
+            auto rev = [](double a) {
+              const double r = std::fmod(a, 360.0);
+              return (r < 0.0) ? r + 360.0 : r;
+            };
+
+            // Days since 2000 Jan 0.0 TDT, the epoch the orbital elements below
+            // are referenced to.
+            const double d = (double) time.timestamp / 86400.0 - 10956.0;
+
+            // The sun is needed twice over: for the elongation that gives the
+            // phase, and for the sidereal time that gives the hour angle.
+            const double sunW = 282.9404 + 4.70935e-5 * d;
+            const double sunE = 0.016709 - 1.151e-9 * d;
+            const double sunM = rev(356.0470 + 0.9856002585 * d);
+
+            const double sunEcc = sunM + sunE * RAD * sind(sunM) * (1.0 + sunE * cosd(sunM));
+            const double sunLon = rev(std::atan2(std::sqrt(1.0 - sunE * sunE) * sind(sunEcc),
+                                                 cosd(sunEcc) - sunE) * RAD + sunW);
+            const double sunMeanLon = rev(sunM + sunW);
+
+            // Moon, from its orbital elements. One Newton step on Kepler's
+            // equation is plenty at this eccentricity.
+            const double moonN = 125.1228 - 0.0529538083 * d;
+            const double moonI = 5.1454;
+            const double moonW = 318.0634 + 0.1643573223 * d;
+            const double moonA = 60.2666;
+            const double moonEcc = 0.054900;
+            const double moonM = rev(115.3654 + 13.0649929509 * d);
+
+            double E = moonM + moonEcc * RAD * sind(moonM) * (1.0 + moonEcc * cosd(moonM));
+            E = E - (E - moonEcc * RAD * sind(E) - moonM) / (1.0 - moonEcc * cosd(E));
+
+            const double mx = moonA * (cosd(E) - moonEcc);
+            const double my = moonA * std::sqrt(1.0 - moonEcc * moonEcc) * sind(E);
+            const double moonR = std::sqrt(mx * mx + my * my);
+            const double vw = std::atan2(my, mx) * RAD + moonW;
+
+            const double xeclip = moonR * (cosd(moonN) * cosd(vw) - sind(moonN) * sind(vw) * cosd(moonI));
+            const double yeclip = moonR * (sind(moonN) * cosd(vw) + cosd(moonN) * sind(vw) * cosd(moonI));
+            const double zeclip = moonR * sind(vw) * sind(moonI);
+
+            double moonLon = std::atan2(yeclip, xeclip) * RAD;
+            double moonLat = std::atan2(zeclip, std::sqrt(xeclip * xeclip + yeclip * yeclip)) * RAD;
+
+            // Perturbations. The moon's orbit is badly behaved - the evection
+            // term alone is 1.27 degrees, which is several minutes of moonrise,
+            // so leaving them out would defeat the point of computing this at
+            // all.
+            const double Lm = rev(moonM + moonW + moonN);
+            const double Dm = rev(Lm - sunMeanLon);
+            const double Fm = rev(Lm - moonN);
+
+            moonLon += -1.274 * sind(moonM - 2.0 * Dm)
+                     +  0.658 * sind(2.0 * Dm)
+                     -  0.186 * sind(sunM)
+                     -  0.059 * sind(2.0 * moonM - 2.0 * Dm)
+                     -  0.057 * sind(moonM - 2.0 * Dm + sunM)
+                     +  0.053 * sind(moonM + 2.0 * Dm)
+                     +  0.046 * sind(2.0 * Dm - sunM)
+                     +  0.041 * sind(moonM - sunM)
+                     -  0.035 * sind(Dm)
+                     -  0.031 * sind(moonM + sunM)
+                     -  0.015 * sind(2.0 * Fm - 2.0 * Dm)
+                     +  0.011 * sind(moonM - 4.0 * Dm);
+
+            moonLat += -0.173 * sind(Fm - 2.0 * Dm)
+                     -  0.055 * sind(moonM - Fm - 2.0 * Dm)
+                     -  0.046 * sind(moonM + Fm - 2.0 * Dm)
+                     +  0.033 * sind(Fm + 2.0 * Dm)
+                     +  0.017 * sind(2.0 * moonM + Fm);
+
+            moonLon = rev(moonLon);
+
+            // Phase from the true elongation between moon and sun. This
+            // replaces a mean synodic month, which ignored that the moon runs
+            // up to six degrees ahead of and behind its mean motion - worth
+            // half a day at the extremes.
+            const double elongation = rev(moonLon - sunLon);
+            const float illuminated = (float) ((1.0 - cosd(elongation)) / 2.0);
+            const bool waxing = elongation < 180.0;
+
+            // Altitude, to know whether the moon is up at all.
+            const double obliq = 23.4393 - 3.563e-7 * d;
+
+            const double xg = cosd(moonLon) * cosd(moonLat);
+            const double yg = sind(moonLon) * cosd(moonLat);
+            const double zg = sind(moonLat);
+
+            const double ye = yg * cosd(obliq) - zg * sind(obliq);
+            const double ze = yg * sind(obliq) + zg * cosd(obliq);
+
+            const double ra = std::atan2(ye, xg) * RAD;
+            const double dec = std::atan2(ze, std::sqrt(xg * xg + ye * ye)) * RAD;
+
+            const double utHours = std::fmod((double) time.timestamp / 3600.0, 24.0);
+            const double lst = rev(sunMeanLon + 180.0 + utHours * 15.0 + obsLon);
+            const double hourAngle = rev(lst - ra);
+
+            double altitude = std::asin(sind(obsLat) * sind(dec) +
+                                        cosd(obsLat) * cosd(dec) * cosd(hourAngle)) * RAD;
+
+            // The moon is near enough that where you stand on the Earth moves
+            // it: about a degree of parallax, which is several minutes either
+            // side of moonrise.
+            altitude -= std::asin(1.0 / moonR) * RAD * cosd(altitude);
+
+            // Below the horizon there is no moon to show. Altitude of the
+            // centre, so this is a few minutes off the almanac's definition,
+            // which uses the upper limb and allows for refraction.
+            if (altitude <= 0.0) {
+              for (int j = 0; j < it.size(); j++) {
+                it[j] = Color(0, 0, 0);
+              }
+              return;
+            }
 
             // in pixels, fractional so the arc grows smoothly across the month
             const float lit = illuminated * (float) it.size();
 
-            // The lit limb faces the sun: right while waxing, left while waning.
-            // At full moon the arc closes and the centre stops mattering.
-            const int centre = (cycles < 0.5) ? (it.size() / 4) : (3 * it.size() / 4);
+            // The lit limb faces the sun: right while waxing seen from the
+            // northern hemisphere, and mirrored south of the equator. At full
+            // moon the arc closes and the centre stops mattering.
+            const bool northern = obsLat >= 0.0;
+            const int centre = (waxing == northern) ? (it.size() / 4) : (3 * it.size() / 4);
 
-            for (int i = 0; i < it.size(); i++) {
+            for (int j = 0; j < it.size(); j++) {
               // distance from the centre of the arc, the short way round
-              int d = std::abs(i - centre);
-              if (d > it.size() / 2) {
-                d = it.size() - d;
+              int dist = std::abs(j - centre);
+              if (dist > it.size() / 2) {
+                dist = it.size() - dist;
               }
 
               // The arc covers lit pixels in total, so lit/2 either side. The
@@ -1604,11 +1725,11 @@ light:
               // a crescent from stepping a whole pixel at a time.
               float level = 0.0f;
               if (lit >= 1.0f) {
-                level = std::min(std::max(lit / 2.0f - (float) d + 1.0f, 0.0f), 1.0f);
+                level = std::min(std::max(lit / 2.0f - (float) dist + 1.0f, 0.0f), 1.0f);
               }
 
               const uint8_t v = (uint8_t) (${MOON_BRIGHTNESS} * level);
-              it[i] = Color(v, v, v);
+              it[j] = Color(v, v, v);
             }
       - addressable_rainbow:
       - addressable_color_wipe:

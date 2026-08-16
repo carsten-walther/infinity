@@ -231,7 +231,7 @@ restarts and is only cleared by a factory reset.
 | --- | --- |
 | `Time` | the clock face: hour, minute and optional second hand as a gradient around the ring, in the colours set by the `Color …` entities, dimmed to ambient light |
 | `Fire` | fire simulation, mirrored across both halves of the ring |
-| `Moon` | the actual moon: the ring lights the illuminated fraction of the disc, so full moon closes the circle and new moon is dark |
+| `Moon` | the actual moon: the ring lights the illuminated fraction of the disc while the moon is above the horizon, and is dark when it has set |
 | `Sun` | the real sun: lights at 12 o'clock as it clears the horizon, opens outwards as it climbs, closes the ring at solar noon, in the sun's own colour |
 | `Alarm` | red pulse, roughly two seconds per cycle |
 
@@ -239,7 +239,7 @@ Plus the ESPHome built-ins: Rainbow, Color Wipe, Scan, Twinkle, Random Twinkle,
 Fireworks and Flicker.
 
 Each effect declares its own `update_interval`, matched to how fast it can actually
-change — 500 ms for `Time`, 30 ms for `Fire` and `Alarm`, 1 s for `Moon`, 10 s for `Sun`.
+change — 500 ms for `Time`, 30 ms for `Fire` and `Alarm`, 10 s for `Sun` and `Moon`.
 Left at the ESPHome default of `0ms` a lambda re-renders all 60 pixels on every
 main-loop pass.
 
@@ -272,10 +272,15 @@ the clock face, not this.
 
 ### Where the coordinates come from
 
-`Latitude` and `Longitude` are text entities, and they are what the effect reads. Two
+`Latitude` and `Longitude` are text entities, and they are what the `Sun` and `Moon`
+effects read. Two
 `internal` `homeassistant` sensors import `zone.home`'s `latitude` and `longitude`
 attributes and write them into those entities, so a device added through the ESPHome
 integration is correct without anyone typing anything.
+
+The `Color …`, `Latitude` and `Longitude` entities all sit in Home Assistant's
+**configuration** category rather than among the controls — they are set once and then
+left alone.
 
 **Home Assistant wins.** Editing the entities by hand works, but the next time HA
 connects or `zone.home` changes it overwrites them. Delete the two `homeassistant`
@@ -289,23 +294,33 @@ The import compares the formatted value before writing. The text entities use
 `restore_value`, so every write reaches flash, and `zone.home` republishes unchanged on
 each reconnect.
 
-`Moon` does follow the real moon. The lit arc is the illuminated fraction of the disc,
-`(1 − cos(2π · cycles)) / 2`, so it grows slowly around new and full and quickly around
-the quarters — and it centres on the right while waxing, on the left while waning, the
-way the lit limb faces:
+`Moon` follows the real moon, and only shows it when it is actually up.
+
+The lit arc is the illuminated fraction of the disc, taken from the true elongation
+between moon and sun, so it grows slowly around new and full and quickly around the
+quarters. Below the horizon the ring is dark.
 
 | Phase | Ring |
 | --- | --- |
 | new | dark |
-| day 3 | 7 of 60 pixels, right of centre |
+| day 3 | 7 of 60 pixels |
 | first quarter | 33 of 60 |
 | full | all 60 |
-| last quarter | 33 of 60, left of centre |
 
-The phase comes from the mean synodic month (29.530588853 days) against the standard
-epoch of 2000-01-06 18:14 UTC. Real lunar months vary between 29.27 and 29.83 days, so
-this can be up to about half a day out — fine for an LED ring, but it is not an
-ephemeris. `MOON_BRIGHTNESS` sets the peak level.
+The position comes from the moon's orbital elements plus the twelve largest
+perturbation terms in longitude and five in latitude. They are not optional: the
+evection term alone is 1.27°, which is several minutes of moonrise. Topocentric
+parallax is applied too — the moon is near enough that where you stand moves it by
+about a degree. Accuracy is a few hundredths of a degree, and moonrise lands within a
+minute or two of an almanac. The threshold is the altitude of the moon's *centre*, so
+it differs slightly from the almanac definition, which uses the upper limb and allows
+for refraction.
+
+The lit limb faces the sun: right while waxing in the northern hemisphere, mirrored
+south of the equator — taken from the `Latitude` entity, so this is correct wherever
+the device is.
+
+`MOON_BRIGHTNESS` sets the peak level.
 
 `gamma_correct` is set to `1.0` rather than the ESPHome default of `2.8`. Gamma is
 right for a light dimmed by hand, but every effect here computes its own gradient —
