@@ -78,6 +78,14 @@ no reason to spend a strapping pin on it.
    Use USB for the first flash; after that OTA works over the network. The web
    interface is then available at `http://infinity.local/`.
 
+   **Build from a local disk.** This config uses the ESP-IDF framework, and IDF's
+   CMake writes compiler probe binaries and reads them straight back. Over SMB or
+   NFS that round-trip is unreliable and the build dies during ABI detection with
+   `CMakeDetermineCompilerABI_CXX.bin cannot be read` / `CMAKE_C_COMPILER not set`.
+   Nothing is wrong with the config — move the checkout to local storage. Building
+   through the Home Assistant ESPHome add-on is unaffected, since that compiles on
+   the Home Assistant host's own filesystem.
+
 3. Calibrate the ambient light sensor — see below.
 
 ## Calibration
@@ -142,7 +150,8 @@ The node is deliberately configured to keep running on its own:
 
 The die ran at 67 °C with `power_save_mode: NONE` and the CPU at its default 160 MHz —
 warm, though well inside the C3's 125 °C limit. With the LED ring on its own supply,
-none of that came from the strip, so two settings address it:
+none of that came from the strip. Two settings brought it down to **38–41 °C**
+(measured 2026-08-16, ten minutes after boot):
 
 - `power_save_mode: LIGHT` (`WIFI_PS_MIN_MODEM`) — sleeps between DTIM beacons instead
   of keeping the radio powered permanently. Only **inbound** traffic is delayed, by up
@@ -168,9 +177,9 @@ default clock, higher receive current — and no working die sensor to measure i
 
 | Entity | Type | Values |
 | --- | --- | --- |
-| `Effect` | Select | any effect from the table below, or `None` to switch the ring off |
+| `Effect` | Select | any effect from the table below, or `Off` to switch the ring off |
 | `Face type` | Select | `Normal`, `Darken to midday` |
-| `Indicator` | Select | `None`, `Show midday`, `Show quadrants`, `Show hour marks` |
+| `Indicator` | Select | `Off`, `Show midday`, `Show quadrants`, `Show hour marks` |
 | `Enable seconds` | Switch | shows the second hand |
 | `Color hour` / `Color minute` / `Color second` | Text | hex colour, e.g. `#FF0000` |
 
@@ -180,12 +189,19 @@ on a dashboard as its own control and be set from an automation without a
 `light.turn_on` service call. It syncs both ways: changing the effect on the light
 updates the select.
 
-Its `None` entry switches the ring **off**. In ESPHome, "None" means "no effect, show
-the light's plain colour" — and that colour is white here, because `on_boot` and
-`on_turn_on` both set red, green and blue to 100 %. Picking it therefore lit the whole
-ring white, which is not what a `None` entry suggests. The option keeps its ESPHome
-name so the reverse sync still matches: `get_effect_name()` reports `None` whenever no
-effect runs, the light being off included.
+Its `Off` entry switches the ring **off**. In ESPHome that entry is called `None` and
+means "no effect, show the light's plain colour" — which is white here, because
+`on_boot` and `on_turn_on` set the `IDLE_*` colour. Picking it therefore lit the whole
+ring white, which is not what the entry suggests.
+
+**No select here offers an option literally named `None`, deliberately.** Home
+Assistant's MQTT integration treats the payload `None` as its `PAYLOAD_NONE` sentinel,
+meaning "no state" — an entity resting on that value shows as `unknown` in the UI
+rather than displaying the selected entry. Both `Effect` and `Indicator` therefore use
+`Off` for their first option. It costs nothing: the effects switch on
+`active_index()`, and `restore_value` stores the index too, so no logic depends on the
+string. The light's `on_state` handler translates between ESPHome's `None` and the
+select's `Off` so the two stay in step.
 
 **Diagnostics** — ESPHome Version, Firmware Version, Device Uptime, Uptime,
 Reset Reason, Reset Count, Internal Temperature, SSID, IP Address, DNS Address,

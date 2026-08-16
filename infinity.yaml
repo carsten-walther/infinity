@@ -42,8 +42,9 @@ substitutions:
 
   #
   # Brightness the clock comes back to on boot and on every switch-on. 60 LEDs
-  # at full white draw around 3.6 A, which is more than the supplies typically
-  # used with this board deliver - and far brighter than a room needs.
+  # at full white draw around 3.6 A - the ring runs on its own supply here, so
+  # that is a question for the power brick rather than for the board, but it is
+  # also far brighter than a room needs.
   #
   DEFAULT_BRIGHTNESS: "70%"
 
@@ -53,11 +54,13 @@ substitutions:
   # The colour the ring carries underneath the effects. Every effect here writes
   # its pixels directly and ignores it, so it is only visible in one situation:
   # no effect running with the light on, which is reachable from the LED color
-  # entity's own effect list ("None" on the Effect select switches the ring off
-  # instead). It is also what the light fades through when an effect starts.
+  # entity's own effect list. The Effect select cannot get there - its "Off"
+  # entry switches the ring off instead. It is also what the light fades through
+  # when an effect starts.
   #
-  # White because a clock face should not be tinted; set it to something warmer
-  # if the bare ring is ever used as a lamp.
+  # Warm white rather than flat 100/100/100. Note that gamma_correct is 1.0 on
+  # this light, so these percentages go to the LEDs linearly and not corrected
+  # for perception - low values come out brighter than they read here.
   #
   IDLE_RED: "100%"
   IDLE_GREEN: "60%"
@@ -242,6 +245,8 @@ wifi:
   # die sat at 67 C with the LED ring on its own supply, so none of that was
   # coming from the strip. LIGHT maps to WIFI_PS_MIN_MODEM, which sleeps between
   # DTIM beacons and wakes for every one of them.
+  #
+  # Measured: 67 C -> 38-41 C, together with the cpu_frequency drop above.
   #
   # The trade is one-sided in this device's favour. Only INBOUND traffic is
   # delayed - the access point buffers it until the next beacon, typically 100
@@ -763,16 +768,22 @@ select:
     optimistic: true
     restore_value: true
 
+  # The first option is "Off" and NOT "None" on purpose. Home Assistant's MQTT
+  # integration treats the literal payload "None" as its PAYLOAD_NONE sentinel,
+  # meaning "no state" - an MQTT select sitting on that value reads as "unknown"
+  # in the UI instead of showing the selected entry. Renaming is safe here
+  # because the Time effect switches on active_index(), and restore_value
+  # stores the index too, so nothing depends on the string.
   - platform: template
     name: Indicator
     icon: mdi:form-select
     id: infinity_indicator
     options:
-      - "None"
+      - "Off"
       - "Show midday"
       - "Show quadrants"
       - "Show hour marks"
-    initial_option: "None"
+    initial_option: "Off"
     optimistic: true
     restore_value: true
 
@@ -784,17 +795,17 @@ select:
   # convenience wrapper so the effect can sit on a dashboard as its own control
   # and be addressed from an automation without a light.turn_on service call.
   #
-  # The option names must match the effect names below EXACTLY, "None"
-  # included: set_action passes the string straight to light.turn_on. There is
-  # no restore_value - the light restores its own effect, and the on_state
-  # handler on the light syncs this select to whatever it came back as.
+  # Every option name must match an effect name below EXACTLY - set_action
+  # passes the string straight to light.turn_on. The one exception is "Off",
+  # which is handled before that and translated in both directions by the
+  # light's on_state handler.
   #
   - platform: template
     name: Effect
     icon: mdi:auto-fix
     id: effect_select_id
     options:
-      - "None"
+      - "Off"
       - "Time"
       - "Fire"
       - "Alarm"
@@ -809,20 +820,22 @@ select:
       - "Addressable Flicker"
     initial_option: "Time"
     optimistic: true
+    restore_value: true
     set_action:
-      # "None" switches the ring OFF rather than selecting the absence of an
-      # effect. ESPHome's "None" means "render the light's plain colour", and
-      # that colour is white here - on_boot and on_turn_on both set red, green
-      # and blue to 100% - so picking it lit the whole ring white, which is not
-      # what anyone reaches for a "None" entry expecting.
+      # "Off" switches the ring off rather than selecting the absence of an
+      # effect. ESPHome calls that entry "None" and means "render the light's
+      # plain colour" by it - and that colour is white here, since on_boot and
+      # on_turn_on both set red, green and blue to IDLE_*. Picking it lit the
+      # whole ring white, which is not what the entry suggests.
       #
-      # The option keeps its ESPHome name because the on_state handler on the
-      # light maps back through it: get_effect_name() reports "None" when no
-      # effect runs, including while the light is off, so the select lands on
-      # this entry either way.
+      # The rename to "Off" is also what keeps the entity readable in Home
+      # Assistant: its MQTT integration treats the literal payload "None" as
+      # PAYLOAD_NONE, i.e. "no state", so a select resting on it shows up as
+      # "unknown". The light's on_state handler translates between the two
+      # names, so ESPHome's "None" and this "Off" stay in step.
       - if:
           condition:
-            lambda: return x == "None";
+            lambda: return x == "Off";
           then:
             - light.turn_off:
                 id: led_ring_id
@@ -1355,10 +1368,15 @@ light:
     # change - brightness, colour, on/off all land here too.
     on_state:
       - lambda: |-
+          // ESPHome reports "None" when no effect is running, the light being
+          // off included. The select calls that entry "Off" - see the comment
+          // on its set_action for why - so translate here rather than letting
+          // the two drift apart.
           const std::string effect = id(led_ring_id).get_effect_name().str();
-          if (id(effect_select_id).current_option().str() != effect &&
-              id(effect_select_id).has_option(effect)) {
-            id(effect_select_id).publish_state(effect);
+          const std::string option = (effect == "None") ? "Off" : effect;
+          if (id(effect_select_id).current_option().str() != option &&
+              id(effect_select_id).has_option(option)) {
+            id(effect_select_id).publish_state(option);
           }
 
     # Switching the light on always lands on the clock face at a known
