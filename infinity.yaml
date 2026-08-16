@@ -114,11 +114,24 @@ substitutions:
   MIN_FACE_BRIGHTNESS: "0.15"
 
   #
-  # How long the Dawn effect takes to run from black to full daylight. It is a
-  # wake-up ramp, driven by its own frame counter - see the effect for why it
-  # cannot follow the actual sunrise.
+  # Sun effect
   #
-  DAWN_DURATION_S: "900"
+  # Starting point for the Latitude and Longitude text entities, which is where
+  # the effect actually reads its coordinates from - these only seed them on the
+  # very first boot. Decimal degrees, north and east positive.
+  #
+  DEFAULT_LATITUDE: "52.520"
+  DEFAULT_LONGITUDE: "13.405"
+
+  #
+  # Solar elevation, in degrees, at which the light has finished warming up and
+  # reads as plain daylight. Below it the colour runs red - orange - yellow, the
+  # way the sun does near the horizon. Lower it for a shorter, sharper sunrise.
+  #
+  # Written with a decimal point on purpose: the lambda appends "f" to build a
+  # float literal, and "25f" is not one.
+  #
+  SUN_WHITE_ELEVATION: "25.0"
 
   #
   # Fire effect
@@ -590,6 +603,71 @@ sensor:
   # Assistant and watch for ten minutes. If the temperature barely moves, the
   # heat is not coming from the ESP32 at all but from the LED supply path.
   #
+  # Coordinates from Home Assistant
+  #
+  # Home Assistant keeps its own installation's location on zone.home. Importing
+  # it means the Sun effect is right without anyone typing coordinates - and the
+  # Latitude / Longitude text entities stay the single value the effect reads,
+  # so nothing downstream has to know where the numbers came from.
+  #
+  # Requires the native API and this device added through the ESPHome
+  # integration; over MQTT alone these never publish. That is the intended
+  # fallback: with no Home Assistant the text entities simply keep their stored
+  # value, and with no stored value the effect falls back to DEFAULT_LATITUDE
+  # and DEFAULT_LONGITUDE.
+  #
+  # Consequence worth knowing: Home Assistant wins. Editing the text entities by
+  # hand works, but the next time HA connects or zone.home changes it overwrites
+  # them. Delete these two sensors if the device should keep its own coordinates.
+  #
+  # internal, because publishing them back to Home Assistant would only echo
+  # what it already told us.
+  #
+  # https://esphome.io/components/sensor/homeassistant
+  #
+  - platform: homeassistant
+    id: ha_latitude_id
+    entity_id: zone.home
+    attribute: latitude
+    internal: true
+    on_value:
+      # The string comparison is not cosmetic: the text entities have
+      # restore_value, so every write hits flash. zone.home republishes on each
+      # reconnect with an unchanged value, and rewriting it every time would
+      # wear the sector for nothing.
+      - lambda: |-
+          if (std::isnan(x)) {
+            return;
+          }
+          char buf[16];
+          snprintf(buf, sizeof(buf), "%.5f", x);
+          if (id(latitude_text_id).state == buf) {
+            return;
+          }
+          auto call = id(latitude_text_id).make_call();
+          call.set_value(buf);
+          call.perform();
+
+  - platform: homeassistant
+    id: ha_longitude_id
+    entity_id: zone.home
+    attribute: longitude
+    internal: true
+    on_value:
+      - lambda: |-
+          if (std::isnan(x)) {
+            return;
+          }
+          char buf[16];
+          snprintf(buf, sizeof(buf), "%.5f", x);
+          if (id(longitude_text_id).state == buf) {
+            return;
+          }
+          auto call = id(longitude_text_id).make_call();
+          call.set_value(buf);
+          call.perform();
+
+  #
   # https://esphome.io/components/sensor/internal_temperature
   #
   - platform: internal_temperature
@@ -764,6 +842,40 @@ text:
     max_length: 7
     initial_value: '#0000FF'
 
+  #
+  # Where the device is, in decimal degrees, north and east positive. The Sun
+  # effect computes the real solar elevation from these, so they decide when the
+  # ring starts to light and how far it opens.
+  #
+  # Text rather than number entities because a number would need a fixed step
+  # and these want free decimals; and text so they can be corrected from Home
+  # Assistant without a reflash. Anything unparseable or out of range falls back
+  # to DEFAULT_LATITUDE / DEFAULT_LONGITUDE rather than throwing away the frame.
+  #
+  - platform: template
+    name: Latitude
+    icon: mdi:latitude
+    id: latitude_text_id
+    mode: text
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    min_length: 1
+    max_length: 12
+    initial_value: '${DEFAULT_LATITUDE}'
+
+  - platform: template
+    name: Longitude
+    icon: mdi:longitude
+    id: longitude_text_id
+    mode: text
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    min_length: 1
+    max_length: 12
+    initial_value: '${DEFAULT_LONGITUDE}'
+
 #
 # The option ORDER is load-bearing: the Time effect switches on
 # active_index(), and its FACETYPE_* / INDICATOR_* constants are the positions
@@ -829,7 +941,7 @@ select:
       - "Time"
       - "Fire"
       - "Alarm"
-      - "Dawn"
+      - "Sun"
       - "Moon"
       - "Rainbow"
       - "Color Wipe"
@@ -1285,98 +1397,147 @@ light:
               it[i] = color;
             }
       #
-      # Sunrise ramp: a wake-up light that opens from midday outwards and warms
-      # from red through amber to daylight, then holds at full.
+      # Real-time simulation of the sun. The ring lights at 12 o'clock the
+      # moment the sun clears the horizon and opens outwards from there as it
+      # climbs, reaching the full circle at solar noon; the colour follows the
+      # sun's own, red at the horizon through orange and yellow to daylight.
+      # Below the horizon the ring is dark.
+      #
+      # This replaces a ramp that ran on its own frame counter over a fixed
+      # duration and had nothing to do with the sky.
       #
       - addressable_lambda:
-          name: Dawn
-          update_interval: 1s
+          name: Sun
+          # The sun moves about 0.004 degrees per second. Over ten seconds that
+          # is far less than one pixel of arc, so anything faster would only
+          # burn cycles - and this lambda is the one piece of real floating
+          # point trigonometry in the config.
+          update_interval: 10s
           lambda: |-
-            // The original fed the raw Unix timestamp into a curve whose
-            // breakpoints (142, 204, 280) only make sense for a small progress
-            // value. Every real timestamp is astronomically larger than 280, so
-            // it took the last branch every time and overflowed the colour
-            // maths - the effect showed one arbitrary constant frame.
+            auto time = id(sntp_time).now();
+
+            if (!time.is_valid()) {
+              for (int i = 0; i < it.size(); i++) {
+                it[i] = Color(0, 0, 0);
+              }
+              return;
+            }
+
+            // Reads a coordinate from its text entity. Anything unparseable,
+            // out of range or non-finite falls back to the compiled default -
+            // this runs every frame, so it must never throw the frame away.
+            auto parseCoord = [](const std::string &s, float fallback, float limit) -> float {
+              if (s.empty()) {
+                return fallback;
+              }
+              char *end = nullptr;
+              const float v = strtof(s.c_str(), &end);
+              if (end == s.c_str() || !std::isfinite(v) || v < -limit || v > limit) {
+                return fallback;
+              }
+              return v;
+            };
+
+            const double lat = parseCoord(id(latitude_text_id).state, ${DEFAULT_LATITUDE}f, 90.0f);
+            const double lon = parseCoord(id(longitude_text_id).state, ${DEFAULT_LONGITUDE}f, 180.0f);
+
+            constexpr double DEG = 0.017453292519943295;
+            constexpr double RAD = 57.29577951308232;
+
+            // Low-precision solar position from the Astronomical Almanac. Good
+            // to well under a tenth of a degree, which is a hundred times finer
+            // than one pixel of this ring.
             //
-            // It cannot follow the real sunrise either: that needs latitude and
-            // longitude via the sun component, which this device does not have.
-            // So it is what it always looked like - a ramp - driven by its own
-            // frame counter over DAWN_DURATION_S and restarted whenever the
-            // effect is selected.
-            constexpr int PROGRESS_END = 280;
-            constexpr int DURATION_S = ${DAWN_DURATION_S};
+            // timestamp is UTC, which is what this needs - the Europe/Berlin
+            // timezone on the sntp component only affects the clock face.
+            const double jd = (double) time.timestamp / 86400.0 + 2440587.5;
+            const double n = jd - 2451545.0;
 
-            static int elapsed = 0;
+            double meanLong = std::fmod(280.460 + 0.9856474 * n, 360.0);
+            double meanAnom = std::fmod(357.528 + 0.9856003 * n, 360.0);
+            if (meanLong < 0.0) meanLong += 360.0;
+            if (meanAnom < 0.0) meanAnom += 360.0;
 
-            if (initial_run) {
-              elapsed = 0;
+            // ecliptic longitude, with the two largest terms of the equation of centre
+            const double eclLong = meanLong + 1.915 * std::sin(meanAnom * DEG)
+                                            + 0.020 * std::sin(2.0 * meanAnom * DEG);
+            const double obliq = 23.439 - 0.0000004 * n;
+
+            const double decl = std::asin(std::sin(obliq * DEG) * std::sin(eclLong * DEG)) * RAD;
+            const double ra = std::atan2(std::cos(obliq * DEG) * std::sin(eclLong * DEG),
+                                         std::cos(eclLong * DEG)) * RAD;
+
+            double gmst = std::fmod(18.697374558 + 24.06570982441908 * n, 24.0);
+            if (gmst < 0.0) gmst += 24.0;
+
+            double hourAngle = std::fmod(gmst * 15.0 + lon - ra, 360.0);
+            if (hourAngle < -180.0) hourAngle += 360.0;
+            if (hourAngle > 180.0) hourAngle -= 360.0;
+
+            const double elevation = std::asin(std::sin(lat * DEG) * std::sin(decl * DEG) +
+                                               std::cos(lat * DEG) * std::cos(decl * DEG) *
+                                               std::cos(hourAngle * DEG)) * RAD;
+
+            // below the horizon there is no sun to show
+            if (elevation <= 0.0) {
+              for (int i = 0; i < it.size(); i++) {
+                it[i] = Color(0, 0, 0);
+              }
+              return;
             }
 
-            // update_interval is 1s, so one tick is one second of the ramp
-            if (elapsed < DURATION_S) {
-              elapsed++;
-            }
+            // How high the sun gets today at this latitude: at solar noon the
+            // hour angle is 0 and the elevation works out to 90 - |lat - decl|.
+            // Normalising against it means the ring closes at local noon on any
+            // day of the year, rather than only in midsummer.
+            const double maxElevation = 90.0 - std::fabs(lat - decl);
+            const float spread = (maxElevation > 0.0)
+                                   ? (float) std::min(elevation / maxElevation, 1.0)
+                                   : 0.0f;
 
-            // scaled rather than stepped: PROGRESS_END / DURATION_S is 0 in
-            // integer maths for any sensible duration, so incrementing would
-            // either never move or run the ramp in PROGRESS_END seconds flat
-            const int i = (int) ((long) elapsed * PROGRESS_END / DURATION_S);
+            // Colour by elevation, over the same red - orange - yellow - white
+            // curve the old ramp used. Its segment boundaries at 142, 204 and
+            // 280 are what give the sunrise its shape, so they are kept and only
+            // the input changed: elevation instead of a frame counter.
+            const int i = (int) (std::min(elevation / ${SUN_WHITE_ELEVATION}f, 1.0) * 280.0);
 
-            // One ramp per channel. The originals were called green, bright and
-            // blue and none of the three named the channel it fed - the
-            // variable called "blue" drove green, "bright" drove blue. Renamed
-            // to what they actually are, because that mix-up is exactly what
-            // hid the bug fixed below.
-            int red_ramp;
+            int red_ramp = std::max(142, i);
+
             int green_ramp;
-            int blue_ramp = 0;
-
-            // starts high and rises: the sky is red before it is anything else
-            red_ramp = std::max(142, i);
-
-            // comes in second, over three segments of increasing steepness
             if (i < 142) {
               green_ramp = i * 64 / 142;
-            } else if (i >= 142 && i < 204) {
+            } else if (i < 204) {
               green_ramp = 64 + (i - 142) * 128 / 62;
             } else {
               green_ramp = 192 + (i - 204) * 64 / 51;
             }
 
-            // last, and only once the sky is already yellow
-            if (i > 204) {
-              blue_ramp = (5 * i - 1020);
-            } else {
-              blue_ramp = 0;
-            }
+            int blue_ramp = (i > 204) ? (5 * i - 1020) : 0;
 
-            // clamp: the curves above run past 255 at the end of the ramp, and
-            // Color takes uint8_t - without this they wrap around to dark
             red_ramp = std::min(red_ramp, 255);
             green_ramp = std::min(green_ramp, 255);
             blue_ramp = std::min(blue_ramp, 255);
 
-            // The channel order used to be Color(green, blue, bright), which
-            // put the blue ramp in the green channel and vice versa. Blue then
-            // rose while green stayed at zero, so the "sunrise" ran dark red ->
-            // magenta -> white. With the ramps in their own channels the curve
-            // does what its segment boundaries were built for: dark red at 0,
-            // orange around 120-180, yellow at 204, white from 255 on.
             const Color sky = Color(red_ramp, green_ramp, blue_ramp);
 
-            // How far the lit arc has opened from midday, in pixels. Both arms
-            // use the same width - the second one was "j > size - width", one
-            // pixel short, so the ring opened faster clockwise than the other
-            // way round.
-            const int width = i * it.size() / PROGRESS_END;
+            // The arc is centred on pixel 0 - 12 o'clock - and opens both ways.
+            // Same antialiased edge as the Moon effect: the boundary pixel is
+            // dimmed by the fractional part, so the light creeps outwards
+            // smoothly instead of stepping a whole pixel at a time, and the +1
+            // closes the ring at noon instead of leaving the pixel opposite
+            // dark.
+            const float half = spread * (float) it.size() / 2.0f;
 
             for (int j = 0; j < it.size(); j++) {
-              if (j < width || j >= it.size() - width) {
-                it[j] = sky;
-              } else {
-                it[j] = Color(0, 0, 0);
+              int d = j;
+              if (d > it.size() / 2) {
+                d = it.size() - d;
               }
+
+              const float level = std::min(std::max(half - (float) d + 1.0f, 0.0f), 1.0f);
+              it[j] = Color(sky.r * level, sky.g * level, sky.b * level);
             }
+
       #
       # Current moon phase as a lit segment.
       #

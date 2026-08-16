@@ -2,7 +2,7 @@
 
 ESPHome firmware for an analogue ring clock built from 60 addressable LEDs. The hour
 and minute hands are drawn as a colour gradient around the ring, accompanied by a
-handful of animation effects (fire, moon phase, dawn).
+handful of animation effects (fire, moon phase, sun).
 
 The whole device — configuration and all C++ animations — lives in a single file,
 [`infinity.yaml`](infinity.yaml). No extra headers or external components are needed.
@@ -99,7 +99,8 @@ All tunables live in `substitutions:` at the top of `infinity.yaml`:
 | `IDLE_RED` / `IDLE_GREEN` / `IDLE_BLUE` | the colour the ring carries underneath the effects |
 | `AMBIENT_DARK` / `AMBIENT_BRIGHT` | LDR divider voltage in a dark room and in full daylight |
 | `MIN_FACE_BRIGHTNESS` | how far the face may dim at night, as a fraction — never `0` |
-| `DAWN_DURATION_S` | length of the `Dawn` ramp |
+| `DEFAULT_LATITUDE` / `DEFAULT_LONGITUDE` | seed values for the `Latitude` / `Longitude` entities on first boot |
+| `SUN_WHITE_ELEVATION` | solar elevation at which `Sun` reads as plain daylight |
 | `FIRE_COOLING` / `FIRE_SPARKING` | how short and how active the `Fire` flames are |
 | `FIRE_MAX_HEAT` | caps the fire palette short of white — raise towards `255` for white tips |
 | `MIDDAY_DARKEN` | how far the `Darken to midday` face dims the arc behind the trailing hand |
@@ -144,7 +145,7 @@ The node is deliberately configured to keep running on its own:
 
 - **API** with encryption and `reboot_timeout: 0s` — no reboot when Home Assistant is unreachable.
 - **MQTT** with `reboot_timeout: 0s` and `discovery: False`; entities have to be added to Home Assistant by hand.
-- **WiFi** with `fast_connect`, power saving disabled, plus a fallback access point and captive portal.
+- **WiFi** with `fast_connect`, light power saving (see below), plus a fallback access point and captive portal.
 - **Web server** (version 3, assets served locally) on port 80.
 - **Time** via SNTP against `pool.ntp.org`, timezone `Europe/Berlin`.
 
@@ -184,6 +185,7 @@ default clock, higher receive current — and no working die sensor to measure i
 | `Indicator` | Select | `Off`, `Show midday`, `Show quadrants`, `Show hour marks` |
 | `Enable seconds` | Switch | shows the second hand |
 | `Color hour` / `Color minute` / `Color second` | Text | hex colour, e.g. `#FF0000` |
+| `Latitude` / `Longitude` | Text | decimal degrees, north and east positive — drives the `Sun` effect |
 
 `Effect` is a convenience wrapper — the `LED color` light entity already carries the
 effect list natively in its more-info dialog. The select exists so the effect can sit
@@ -230,20 +232,62 @@ restarts and is only cleared by a factory reset.
 | `Time` | the clock face: hour, minute and optional second hand as a gradient around the ring, in the colours set by the `Color …` entities, dimmed to ambient light |
 | `Fire` | fire simulation, mirrored across both halves of the ring |
 | `Moon` | the actual moon: the ring lights the illuminated fraction of the disc, so full moon closes the circle and new moon is dark |
-| `Dawn` | wake-up ramp: opens from midday outwards and warms from red through amber to daylight over `DAWN_DURATION_S`, then holds |
+| `Sun` | the real sun: lights at 12 o'clock as it clears the horizon, opens outwards as it climbs, closes the ring at solar noon, in the sun's own colour |
 | `Alarm` | red pulse, roughly two seconds per cycle |
 
 Plus the ESPHome built-ins: Rainbow, Color Wipe, Scan, Twinkle, Random Twinkle,
 Fireworks and Flicker.
 
 Each effect declares its own `update_interval`, matched to how fast it can actually
-change — 500 ms for `Time`, 30 ms for `Fire` and `Alarm`, 1 s for `Dawn` and `Moon`.
+change — 500 ms for `Time`, 30 ms for `Fire` and `Alarm`, 1 s for `Moon`, 10 s for `Sun`.
 Left at the ESPHome default of `0ms` a lambda re-renders all 60 pixels on every
 main-loop pass.
 
-`Dawn` does not follow the real sunrise: that needs latitude and longitude via the
-`sun` component, which this device does not configure. It is a ramp on its own frame
-counter, restarted whenever the effect is selected.
+`Sun` simulates the sun in real time. It computes the solar elevation for the
+device's own coordinates and shows it directly: dark below the horizon, one pixel at
+12 o'clock the moment the sun rises, opening outwards as it climbs, the full circle at
+solar noon, then closing again towards sunset. The colour follows the sun too — deep
+red at the horizon through orange and yellow to daylight white above
+`SUN_WHITE_ELEVATION`.
+
+Berlin, 16 August, times UTC:
+
+| UTC | Elevation | Pixels lit | Colour |
+| --- | --- | --- | --- |
+| 03:00 | −7.5° | 0 | dark |
+| 04:00 | +0.5° | 3 | `(142, 2, 0)` deep red |
+| 06:00 | 18.3° | 23 | `(205, 193, 5)` yellow |
+| 11:00 | 51.1° | 60 | `(255, 255, 255)` daylight |
+| 17:00 | 12.3° | 17 | `(142, 62, 0)` orange |
+| 19:00 | −4.9° | 0 | dark |
+
+The arc is normalised against the highest the sun gets *that day*
+(`90° − |latitude − declination|`), so the ring closes at local noon in December as
+well as in June.
+
+The position comes from the low-precision solar algorithm in the Astronomical Almanac,
+accurate to well under a tenth of a degree — a hundred times finer than one pixel of
+this ring. It reads UTC from the clock, so the `Europe/Berlin` timezone affects only
+the clock face, not this.
+
+### Where the coordinates come from
+
+`Latitude` and `Longitude` are text entities, and they are what the effect reads. Two
+`internal` `homeassistant` sensors import `zone.home`'s `latitude` and `longitude`
+attributes and write them into those entities, so a device added through the ESPHome
+integration is correct without anyone typing anything.
+
+**Home Assistant wins.** Editing the entities by hand works, but the next time HA
+connects or `zone.home` changes it overwrites them. Delete the two `homeassistant`
+sensors if the device should keep its own coordinates.
+
+Without Home Assistant — MQTT only, or standalone — the imports never publish and the
+text entities simply keep their stored value; with no stored value the effect falls
+back to `DEFAULT_LATITUDE` / `DEFAULT_LONGITUDE`.
+
+The import compares the formatted value before writing. The text entities use
+`restore_value`, so every write reaches flash, and `zone.home` republishes unchanged on
+each reconnect.
 
 `Moon` does follow the real moon. The lit arc is the illuminated fraction of the disc,
 `(1 − cos(2π · cycles)) / 2`, so it grows slowly around new and full and quickly around
@@ -294,7 +338,6 @@ face.
   over time — so WiFi has not associated yet and the condition is always false. A real
   "waiting for network" indicator needs a `wifi:` `on_connect` / `on_disconnect`
   trigger. The block is kept, commented, to document the trap.
-- **`Dawn` is not tied to the actual sunrise**, see above.
 
 ## License
 
