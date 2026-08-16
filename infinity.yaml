@@ -1,0 +1,1102 @@
+# ═══════════════════════════════════════════════════════════
+#  Infinity
+#  Analogue Clock with NeoPixels | MQTT | Home Assistant
+# ═══════════════════════════════════════════════════════════
+
+# Pinout: https://randomnerdtutorials.com/esp32-c3-pinout-reference-gpios/
+
+substitutions:
+
+  project_name: infinity
+  author_name: carsten-walther
+  friendly_name: Infinity
+  comment: Just another analogue clock
+  version: 2026.8.16
+  area: Miscellaneous
+
+  #
+  # GPIOs
+  #
+  PIN_LED_RING: GPIO02
+  PIN_BRIGHTNESS: GPIO01
+
+  #
+  # LED ring
+  #
+  # 60 is not a decorative choice: one pixel per minute means a pixel index IS
+  # the minute (and second) value, and the hour hand lands on hour * 5. Every
+  # effect below and all of the indicator maths assume that mapping, so changing
+  # this number alone does not produce a working clock.
+  #
+  NUM_LEDS: "60"
+
+  #
+  # Brightness the clock comes back to on boot and on every switch-on. 60 LEDs
+  # at full white draw around 3.6 A, which is more than the supplies typically
+  # used with this board deliver - and far brighter than a room needs.
+  #
+  DEFAULT_BRIGHTNESS: "70%"
+
+  #
+  # Ambient light calibration
+  #
+  # The two readings the Brightness sensor reports in a dark room and in full
+  # daylight, in the same unit that sensor publishes. The Time effect maps
+  # anything in between onto a linear dim factor, so these are the only two
+  # numbers to touch when calibrating.
+  #
+  # These are a starting point, not a measurement - the divider on
+  # ${PIN_BRIGHTNESS} decides the real range. Read the sensor once in the dark
+  # and once in the sun and put those values here.
+  #
+  # If the clock dims the wrong way round, the photoresistor sits on the other
+  # leg of the divider: SWAP these two values, no code change needed.
+  #
+  AMBIENT_DARK: "5.0"
+  AMBIENT_BRIGHT: "80.0"
+
+  #
+  # How far the face is allowed to dim at night, as a fraction of the light's
+  # own brightness setting. Never 0 - a clock that reads as "off" in a dark room
+  # is worse than one that is slightly too bright.
+  #
+  MIN_FACE_BRIGHTNESS: "0.15"
+
+  #
+  # How long the Dawn effect takes to run from black to full daylight. It is a
+  # wake-up ramp, driven by its own frame counter - see the effect for why it
+  # cannot follow the actual sunrise.
+  #
+  DAWN_DURATION_S: "900"
+
+#
+# https://esphome.io/components/esphome
+#
+esphome:
+  name: "${project_name}"
+  friendly_name: "${friendly_name}"
+  comment: "${comment}"
+  area: "${area}"
+
+  project:
+    name: "${author_name}.${project_name}"
+    version: "${version}"
+
+  on_boot:
+    # priority 600 runs after hardware init, so the ring is already addressable
+    - priority: 600
+      then:
+        - light.turn_on:
+            id: led_ring_id
+            effect: Twinkle
+
+    # NOTE: this block is effectively dead and kept only to document that.
+    # Every on_boot trigger fires during setup(), milliseconds apart - the
+    # priorities order them, they do not space them out in time. WiFi has not
+    # associated yet at this point, so the condition is false on every boot and
+    # the Twinkle above is never the "waiting for network" indicator it looks
+    # like. Doing that properly needs a wifi on_connect / on_disconnect trigger,
+    # not a boot priority.
+    - priority: 200
+      then:
+        if:
+          condition:
+            wifi.connected:
+          then:
+            - light.turn_off:
+                id: led_ring_id
+
+    # Negative priority runs after every component is set up, which is what both
+    # of these need: the light has to exist before an effect can be selected,
+    # and component.update() on a not-yet-set-up entity is not something to rely
+    # on.
+    - priority: -100
+      then:
+        - light.turn_on:
+            id: led_ring_id
+            brightness: ${DEFAULT_BRIGHTNESS}
+            red: 100%
+            green: 100%
+            blue: 100%
+            effect: Time
+        # publishes the compile-time version string once, see firmware_version_id
+        - component.update: firmware_version_id
+
+  # priority 700 runs early enough that the light is still controllable
+  on_shutdown:
+    priority: 700
+    then:
+      - light.turn_off:
+          id: led_ring_id
+
+#
+# https://esphome.io/components/esp32
+#
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    # esp-idf, not arduino: the only thing that tied this device to arduino was
+    # the neopixelbus light platform, which wraps an Arduino library. The light
+    # below now uses esp32_rmt_led_strip, which drives the same RMT peripheral
+    # neopixelbus was already configured to use - so this costs nothing on the
+    # wire and drops the whole Arduino layer from flash and RAM.
+    #
+    # Consequence: no Arduino-only APIs (String, WiFi.*, byte, the min/max
+    # macros) in any lambda here. The effect lambdas use std::min / std::max /
+    # std::abs for exactly that reason.
+    type: esp-idf
+
+#
+# https://esphome.io/components/wifi
+#
+wifi:
+  id: wifi_id
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  domain: .local
+  fast_connect: True
+  power_save_mode: NONE
+  enable_on_boot: True
+  ap:
+    ssid: "${project_name}"
+    password: !secret wifi_ap_password
+
+#
+# https://esphome.io/components/captive_portal
+#
+captive_portal:
+
+#
+# Only the classic push OTA from the dashboard: this node has no display to
+# show progress on, so the http_request pull path is not worth the flash.
+#
+ota:
+  #
+  # https://esphome.io/components/ota/esphome
+  #
+  - platform: esphome
+    password: !secret ota_password
+
+#
+# https://esphome.io/components/api
+#
+api:
+  # Enable transport encryption of the API layer.
+  encryption:
+    # The pre-shared key for the encryption.
+    key: !secret api_encryption_key
+  # 0s disables the automatic reboot when Home Assistant is unreachable: this
+  # node keeps running the clock and publishing via MQTT even without an API
+  # client, which matters because it is the only clock in the room.
+  reboot_timeout: 0s
+
+#
+# https://esphome.io/components/mqtt
+#
+mqtt:
+  id: mqtt_client_id
+  broker: !secret mqtt_broker
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  reboot_timeout: 0s
+  enable_on_boot: True
+  # No autodiscovery: the entities are declared in Home Assistant by hand, so
+  # discovery would only publish retained config topics nobody consumes.
+  discovery: False
+  keepalive: 60s
+
+#
+# https://esphome.io/components/web_server
+#
+web_server:
+  port: 80
+  version: 3
+  # assets served from flash instead of a CDN, so the page also works while the
+  # WiFi has no route to the internet - e.g. from the fallback access point
+  local: True
+
+#
+# https://esphome.io/components/time
+#
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Berlin
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - 2.pool.ntp.org
+
+#
+# https://esphome.io/components/logger
+#
+logger:
+  # ERROR only: the ring is driven from a lambda that runs many times a second,
+  # and logging at that rate over the api costs more than the messages are worth
+  level: ERROR
+
+#
+# https://esphome.io/components/globals
+#
+globals:
+
+  #
+  # Latch so the "invalid time from sntp" error is logged once per boot instead
+  # of on every frame. The Time effect runs several times a second; without this
+  # a device that never reaches an NTP server would flood the log and the api.
+  #
+  - id: global_debug
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  #
+  # Mirrors the Enable seconds switch. The effect lambda needs the value at
+  # frame rate, and reading a global is cheaper than going through the switch
+  # component every time.
+  #
+  - id: global_enable_seconds
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+#
+# https://esphome.io/components/text_sensor
+#
+text_sensor:
+
+  #
+  # ESPHome Version
+  # https://esphome.io/components/text_sensor/version
+  #
+  - platform: version
+    name: ESPHome Version
+    icon: mdi:new-box
+
+  #
+  # Firmware Version
+  #
+  - platform: template
+    id: firmware_version_id
+    name: Firmware Version
+    icon: mdi:new-box
+    # A compile-time constant. Polling it re-sent the same string to the api and
+    # mqtt every 60s for the lifetime of the device; publish_state does not
+    # deduplicate, so nothing upstream was filtering that out. Published once
+    # from the late on_boot block instead.
+    update_interval: never
+    lambda: |-
+      return {"$version"};
+
+  #
+  # Device Uptime
+  #
+  - platform: template
+    name: Device Uptime
+    icon: mdi:clock-start
+    entity_category: diagnostic
+    device_class: ""
+    lambda: |-
+          // The uptime sensor only publishes from update(), so its state is NaN
+          // until the first poll. Test that BEFORE the cast: converting a NaN
+          // float to int is undefined behaviour, and the guard this replaces
+          // ("days > 3650") assumed the cast would yield a huge positive value.
+          // It generally does not, so the fallback below never actually fired
+          // and the first minute showed whatever the conversion happened to
+          // produce.
+          const float uptime = id(uptime_seconds_id).state;
+          if (std::isnan(uptime)) {
+            return {"Starting up"};
+          }
+
+          int seconds = (int) uptime;
+          int days = seconds / (24 * 3600);
+
+          seconds = seconds % (24 * 3600);
+
+          int hours = seconds / 3600;
+          seconds = seconds % 3600;
+
+          int minutes = seconds /  60;
+          seconds = seconds % 60;
+
+          char buf[32];
+          if (days) {
+            snprintf(buf, sizeof(buf), "%dd %dh %dm %ds", days, hours, minutes, seconds);
+          } else if (hours) {
+            snprintf(buf, sizeof(buf), "%dh %dm %ds", hours, minutes, seconds);
+          } else if (minutes) {
+            snprintf(buf, sizeof(buf), "%dm %ds", minutes, seconds);
+          } else {
+            snprintf(buf, sizeof(buf), "%ds", seconds);
+          }
+          return {buf};
+
+  #
+  # WiFi Information
+  # https://esphome.io/components/text_sensor/wifi_info
+  #
+  - platform: wifi_info
+    ssid:
+      name: SSID
+      icon: mdi:wifi-star
+    ip_address:
+      id: ip_address_id
+      name: IP Address
+      icon: mdi:ip-network-outline
+    dns_address:
+      name: DNS Address
+      icon: mdi:dns-outline
+
+#
+# https://esphome.io/components/binary_sensor
+#
+binary_sensor:
+
+  #
+  # Connection Status
+  # https://esphome.io/components/binary_sensor/status
+  #
+  - platform: status
+    name: Connection Status
+    icon: mdi:connection
+
+#
+# https://esphome.io/components/button
+#
+button:
+
+  #
+  # https://esphome.io/components/button/restart
+  #
+  - platform: restart
+    id: restart_id
+    name: Restart
+    icon: mdi:reload
+
+  #
+  # Clears every stored preference - the persisted hand colours included - and
+  # drops the WiFi credentials, so the device comes back on the fallback AP.
+  # https://esphome.io/components/button/factory_reset
+  #
+  - platform: factory_reset
+    id: factoryreset_id
+    name: Factory Reset
+    icon: mdi:restart
+
+  #
+  # Reboots with all user components disabled, leaving only WiFi and OTA. The
+  # way back in when a bad effect lambda takes the device down before it can be
+  # flashed.
+  # https://esphome.io/components/button/safe_mode
+  #
+  - platform: safe_mode
+    id: safemode_id
+    name: Restart (Safe Mode)
+    icon: mdi:reload
+
+#
+# https://esphome.io/components/sensor
+#
+sensor:
+
+  #
+  # https://esphome.io/components/sensor/uptime
+  #
+  - platform: uptime
+    id: uptime_seconds_id
+    name: Uptime
+    icon: mdi:timer-outline
+    type: seconds
+    internal: True
+    entity_category: diagnostic
+    device_class: ""
+
+  #
+  # https://esphome.io/components/sensor/wifi_signal
+  #
+  - platform: wifi_signal
+    id: wifi_signal_db
+    name: WiFi Signal (dBm)
+    icon: mdi:wifi
+    entity_category: diagnostic
+    device_class: ""
+    unit_of_measurement: "dBm"
+    update_interval: 60s
+
+  #
+  # The same reading as a percentage, for people who do not read dBm. Derived
+  # with copy rather than a second wifi_signal so both entities always agree.
+  # https://esphome.io/components/sensor/copy
+  #
+  - platform: copy
+    id: wifi_signal_percent
+    name: WiFi Signal (%)
+    icon: mdi:wifi
+    source_id: wifi_signal_db
+    unit_of_measurement: "%"
+    entity_category: diagnostic
+    device_class: ""
+    filters:
+      # std:: qualified: min/max are Arduino macros, and this device builds
+      # against esp-idf where they do not exist
+      - lambda: return std::min(std::max(2 * (x + 100.0), 0.0), 100.0);
+
+  #
+  # Ambient brightness, intended to dim the clock face at night.
+  #
+  # ToDo: nothing consumes this yet - the Time effect carries the matching
+  # ToDo markers. Until then it is a plain measurement.
+  #
+  # https://esphome.io/components/sensor/adc
+  #
+  - platform: adc
+    id: brightness_sensor
+    name: Brightness sensor
+    icon: mdi:brightness-6
+    pin: ${PIN_BRIGHTNESS}
+    update_interval: 5s
+    unit_of_measurement: '%'
+    filters:
+      - multiply: 100
+
+#
+# https://esphome.io/components/switch/template
+#
+switch:
+
+  #
+  # Kept optimistic on purpose: the state lives in global_enable_seconds, which
+  # the effect reads at frame rate, so there is nothing to read back from.
+  #
+  # restore_mode is spelled out because the schema default is ALWAYS_OFF - the
+  # setting was silently lost on every reboot. Restoring also re-runs
+  # turn_on_action, so the global gets seeded from the stored state and the
+  # global itself does not need to persist.
+  #
+  - platform: template
+    name: Enable seconds
+    icon: mdi:clock-outline
+    id: infinity_enable_seconds
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      then:
+        lambda: |-
+          id(global_enable_seconds) = 1;
+    turn_off_action:
+      then:
+        lambda: |-
+          id(global_enable_seconds) = 0;
+
+#
+# Hand colours as "#RRGGBB". These entities ARE the stored value - the Time
+# effect reads id(...).state directly and parses it, so there is no global to
+# keep in sync and no set_action to write one. That replaces the previous
+# arrangement, where three restoring globals shadowed these three entities and
+# nothing ever read either side.
+#
+# restore_value persists the user's palette across a power cut; initial_value
+# only applies on the very first boot. min_length is 7 as well as max_length:
+# anything shorter cannot be a valid #RRGGBB, and rejecting it in the schema is
+# better than silently falling back in the effect on every frame.
+#
+# https://esphome.io/components/text/template
+#
+text:
+
+  - platform: template
+    name: Color hour
+    icon: mdi:palette
+    id: infinity_color_hour
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 7
+    max_length: 7
+    initial_value: '#FF0000'
+
+  - platform: template
+    name: Color minute
+    icon: mdi:palette
+    id: infinity_color_minute
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 7
+    max_length: 7
+    initial_value: '#00FF00'
+
+  - platform: template
+    name: Color second
+    icon: mdi:palette
+    id: infinity_color_second
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 7
+    max_length: 7
+    initial_value: '#0000FF'
+
+#
+# The option ORDER is load-bearing: the Time effect switches on
+# active_index(), and its FACETYPE_* / INDICATOR_* constants are the positions
+# in these lists. Reordering or inserting an option silently remaps the face.
+#
+# restore_value on both: without it the schema default is false and every reboot
+# reset the face to Normal / None. initial_option only applies on the very first
+# boot now, or after a factory reset.
+#
+# https://esphome.io/components/select/template
+#
+select:
+
+  - platform: template
+    name: Face type
+    icon: mdi:clock-time-two-outline
+    id: infinity_face_type
+    options:
+      - "Normal"
+      - "Darken to midday"
+    initial_option: "Normal"
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: Indicator
+    icon: mdi:form-select
+    id: infinity_indicator
+    options:
+      - "None"
+      - "Show midday"
+      - "Show quadrants"
+      - "Show hour marks"
+    initial_option: "None"
+    optimistic: true
+    restore_value: true
+
+#
+# The clock face itself. Every animation below is an addressable_lambda rather
+# than an external component or a header in esphome.includes, which keeps the
+# whole device in this one file.
+#
+# https://esphome.io/components/light/esp32_rmt_led_strip
+#
+light:
+  - platform: esp32_rmt_led_strip
+    id: led_ring_id
+    name: LED color
+    icon: mdi:led-outline
+    chipset: WS2811
+    rgb_order: GRB
+    pin: ${PIN_LED_RING}
+    num_leds: ${NUM_LEDS}
+    default_transition_length: 1s
+
+    # The schema default is 2.8, which is right for a light you dim by hand: it
+    # makes the dimmer curve look linear to the eye. It is wrong here, because
+    # every effect below computes its own gradient - gamma is then applied on
+    # top of maths that already decided what each pixel should look like, and it
+    # crushes the dark end of the hour/minute blend into black. 1.0 hands the
+    # computed value straight to the LED.
+    gamma_correct: 1.0
+
+    effects:
+
+      #
+      # The clock face. Hour and minute hand are drawn as a gradient around the
+      # ring, so the two arcs between them carry the reading even when a hand
+      # sits behind the other.
+      #
+      - addressable_lambda:
+          name: Time
+          # The smallest thing shown is a second, so anything faster is wasted
+          # work. Left at the 0ms default this lambda re-rendered 60 pixels on
+          # every main-loop pass - thousands of times a second for a display
+          # that changes once a second.
+          update_interval: 500ms
+          lambda: |-
+            // face types
+            constexpr int FACETYPE_NORMAL = 0;
+            constexpr int FACETYPE_DARKEN_TO_MIDDAY = 1;
+
+            // indicators
+            constexpr int INDICATOR_SHOW_NONE = 0;
+            constexpr int INDICATOR_SHOW_MIDDAY = 1;
+            constexpr int INDICATOR_SHOW_QUADRANTS = 2;
+            constexpr int INDICATOR_SHOW_HOUR_MARKS = 3;
+
+            auto linearBlend = [](Color left, Color right, float progress) -> Color {
+              return Color(left.r + ((right.r - left.r) * progress),
+                           left.g + ((right.g - left.g) * progress),
+                           left.b + ((right.b - left.b) * progress));
+            };
+
+            auto darken = [](Color color, uint8_t delta) -> Color {
+              color.r = (color.r > delta) ? color.r - delta : 0;
+              color.g = (color.g > delta) ? color.g - delta : 0;
+              color.b = (color.b > delta) ? color.b - delta : 0;
+              return color;
+            };
+
+            // set the LED to the inverse of the two LEDs next to it, showing as white on the main face
+            auto invertLED = [&](int32_t i) {
+              Color averagecolor = linearBlend(it[(i - 1 + it.size()) % it.size()].get(),
+                                               it[(i + 1) % it.size()].get(), 0.5f);
+              averagecolor = Color(255 - averagecolor.r, 255 - averagecolor.g, 255 - averagecolor.b);
+              it[i] = averagecolor;
+            };
+
+            // Reads "#RRGGBB" from a Color * text entity. Parsed per frame on
+            // purpose: it is a handful of instructions, and it means an edit in
+            // Home Assistant shows on the next frame without any cache to
+            // invalidate. Anything unparseable falls back rather than throwing
+            // away the frame.
+            auto parseColor = [](const std::string &hex, Color fallback) -> Color {
+              if (hex.length() != 7 || hex[0] != '#') {
+                return fallback;
+              }
+              char *end = nullptr;
+              const long value = strtol(hex.c_str() + 1, &end, 16);
+              if (end != hex.c_str() + 7) {
+                return fallback;
+              }
+              return Color((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF);
+            };
+
+            auto time = id(sntp_time).now();
+
+            const float blendPoint = 0.5;
+
+            int hour = time.hour;
+            int minute = time.minute;
+            int second = time.second;
+
+            if (!time.is_valid()) {
+              if (id(global_debug) < 1) {
+                ESP_LOGE("lambda", "Got invalid time from sntp_time. Time is: %i:%i", hour, minute);
+                id(global_debug) = 1;
+              }
+              return;
+            }
+
+            auto face_type = id(infinity_face_type).active_index();
+            auto indicator = id(infinity_indicator).active_index();
+            auto enable_seconds = id(global_enable_seconds);
+
+            // this face colours the clock in 2 sections, the c1->c2 divide
+            // represents the minute hand and the c2->c1 divide represents the hour hand.
+            Color c1;
+            Color c1blend;
+            Color c2;
+            Color c2blend;
+
+            int gap;
+            int firsthand = std::min(hour, minute);
+            int secondhand = std::max(hour, minute);
+
+            Color hour_color = parseColor(id(infinity_color_hour).state, Color(255, 0, 0));
+            Color minute_color = parseColor(id(infinity_color_minute).state, Color(0, 255, 0));
+            Color second_color = parseColor(id(infinity_color_second).state, Color(0, 0, 255));
+
+            // check which hand is first, so we know what colour the 0 pixel is
+            //
+            // The else branch used to build c1 as (r, b, g) - green and blue
+            // swapped. That was invisible while hour_color was hard-coded pure
+            // red, but the colour is user-supplied now, so any hand colour with
+            // two components would have rendered differently depending on
+            // whether the hour or the minute hand came first.
+            if (hour > minute) {
+              c2 = Color(hour_color.r, hour_color.g, hour_color.b);
+              c1 = Color(minute_color.r, minute_color.g, minute_color.b);
+            } else {
+              c1 = Color(hour_color.r, hour_color.g, hour_color.b);
+              c2 = Color(minute_color.r, minute_color.g, minute_color.b);
+            }
+
+            // The blending is the colour that the hour/minute colour will meet.
+            // The greater the blend, the closer to the actual hour/minute colour it gets.
+            c2blend = linearBlend(c2, c1, (float) blendPoint / 255);
+            c1blend = linearBlend(c1, c2, (float) blendPoint / 255);
+
+            gap = secondhand - firsthand;
+
+            // create the blend between first and 2nd hand
+            for (int i = firsthand; i < secondhand; i++) {
+              it[i] = linearBlend(c2blend, c2, ((float) i - (float) firsthand) / (float) gap);
+            }
+
+            gap = it.size() - gap;
+
+            // and the last hand
+            for (int i = secondhand; i < it.size() + firsthand; i++) {
+              it[i % it.size()] = linearBlend(c1blend, c1, ((float) i - (float) secondhand) / (float) gap);
+            }
+
+            it[hour] = hour_color;
+            it[minute] = minute_color;
+
+            // face types
+            switch (face_type.value()) {
+              default:
+                break;
+              case FACETYPE_NORMAL:
+                break;
+              case FACETYPE_DARKEN_TO_MIDDAY: {
+                // darkens the pixels between the second hand and midday because Brian suggested it.
+                for (int i = std::max(hour, minute); i < it.size(); i++) {
+                  it[i] = darken(it[i].get(), 240);
+                }
+                break;
+              }
+            }
+
+            // indicator
+            switch (indicator.value()) {
+              default:
+                break;
+              case INDICATOR_SHOW_NONE:
+                break;
+              case INDICATOR_SHOW_MIDDAY:
+                // shows a bright light at midday to orient the user
+                invertLED(0);
+                break;
+              case INDICATOR_SHOW_QUADRANTS:
+                for (int i = 0; i < 4; i++) {
+                  invertLED(i * it.size() / 4);
+                }
+                break;
+              case INDICATOR_SHOW_HOUR_MARKS:
+                for (int i = 0; i < 12; i++) {
+                  invertLED(i * it.size() / 12);
+                }
+                break;
+            }
+
+            if (enable_seconds) {
+              it[second] = second_color;
+            }
+
+            // Ambient dimming, applied once over the finished frame. Doing it
+            // here rather than per-draw is what the four separate ToDo markers
+            // in this lambda used to ask for, and it is also more correct: the
+            // gradient, both hands and the inverted indicator pixels all go
+            // through the same factor, so the face keeps its contrast as it
+            // dims instead of the indicators staying bright against a dark ring.
+            //
+            // NaN until the adc has published once - leave the frame alone then
+            // rather than multiplying by garbage.
+            const float ambient = id(brightness_sensor).state;
+            if (!std::isnan(ambient)) {
+              // Swapping AMBIENT_DARK and AMBIENT_BRIGHT inverts this mapping,
+              // which is the documented fix for a divider wired the other way
+              // round - the subtraction handles a negative span on its own.
+              const float span = ${AMBIENT_BRIGHT}f - ${AMBIENT_DARK}f;
+              float t = (span == 0.0f) ? 1.0f : (ambient - ${AMBIENT_DARK}f) / span;
+              t = std::min(std::max(t, 0.0f), 1.0f);
+
+              const float dim = ${MIN_FACE_BRIGHTNESS}f + (1.0f - ${MIN_FACE_BRIGHTNESS}f) * t;
+              for (int i = 0; i < it.size(); i++) {
+                const Color c = it[i].get();
+                it[i] = Color(c.r * dim, c.g * dim, c.b * dim);
+              }
+            }
+      #
+      # Fire simulation, mirrored across both halves of the ring.
+      #
+      - addressable_lambda:
+          name: Fire
+          # The cooling/diffusion model assumes a fixed step rate - the original
+          # had a speedDelay parameter for exactly this. Running it once per
+          # main-loop pass burns the heat buffer down far faster than the sparks
+          # can refill it, which looks like noise rather than flames.
+          update_interval: 30ms
+          lambda: |-
+            // The first one (Cooling) indicates how fast a flame cools down.
+            // More cooling means shorter flames, and the recommended values are between 20 and 100.
+            constexpr int cooling = 15;
+
+            // The second parameter (Sparking) indicates the chance (out of 255) that a spark will ignite.
+            // A higher value makes the fire more active. Suggested values lay between 50 and 200.
+            constexpr int sparking = 120;
+
+            constexpr int MAX_PIXELS = 128;
+
+            int numPixels = it.size() / 2;
+            if (numPixels > MAX_PIXELS) {
+              numPixels = MAX_PIXELS;
+            }
+
+            // has to survive between frames, otherwise cooling and diffusion
+            // operate on a fresh (uninitialised) buffer every single frame
+            static uint8_t heat[MAX_PIXELS] = {};
+            static uint16_t rand16seed = 0;
+
+            // Generate an 8-bit random number
+            auto random8 = [&]() -> uint8_t {
+              rand16seed = (rand16seed * (uint16_t) 2053) + (uint16_t) 13849;
+              // return the sum of the high and low bytes, for better
+              // mixing and non-sequential correlation
+              return (uint8_t)(((uint8_t)(rand16seed & 0xFF)) + ((uint8_t)(rand16seed >> 8)));
+            };
+
+            // Generate an 8-bit random number between 0 and lim
+            auto random8_max = [&](uint8_t lim) -> uint8_t {
+              return ((uint16_t) random8() * lim) >> 8;
+            };
+
+            // Generate an 8-bit random number in the given range
+            auto random8_range = [&](uint8_t min_value, uint8_t lim) -> uint8_t {
+              return random8_max(lim - min_value) + min_value;
+            };
+
+            // subtract one byte from another, saturating at 0x00
+            auto qsub8 = [](uint8_t i, uint8_t j) -> uint8_t {
+              int t = i - j;
+              return (t < 0) ? 0 : t;
+            };
+
+            // add one byte to another, saturating at 0xFF
+            auto qadd8 = [](uint8_t i, uint8_t j) -> uint8_t {
+              unsigned int t = i + j;
+              return (t > 255) ? 255 : t;
+            };
+
+            auto getHeatColor = [](uint8_t temperature) -> Color {
+              Color heatcolor = Color(0, 0, 0);
+
+              // Scale 'heat' down from 0-255 to 0-191,
+              // which can then be easily divided into three
+              // equal 'thirds' of 64 units each.
+              uint8_t t192 = std::round((temperature / 255.0) * 191);
+
+              // calculate a value that ramps up from
+              // zero to 255 in each 'third' of the scale.
+              uint8_t heatramp = t192 & 0x3F; // 0..63
+              heatramp <<= 2;                 // scale up to 0..252
+
+              // now figure out which third of the spectrum we're in:
+              if (t192 & 0x80) {
+                // we're in the hottest third
+                heatcolor.r = 255;      // full red
+                heatcolor.g = 255;      // full green
+                heatcolor.b = heatramp; // ramp up blue
+              } else if (t192 & 0x40) {
+                // we're in the middle third
+                heatcolor.r = 255;      // full red
+                heatcolor.g = heatramp; // ramp up green
+                heatcolor.b = 0;        // no blue
+              } else {
+                // we're in the coolest third
+                heatcolor.r = heatramp; // ramp up red
+                heatcolor.g = 0;        // no green
+                heatcolor.b = 0;        // no blue
+              }
+
+              return heatcolor;
+            };
+
+            // Step 1. Cool down every cell a little
+            for (int i = 0; i < numPixels; i++) {
+              heat[i] = qsub8(heat[i], random8_range(0, ((cooling * 10) / numPixels) + 2));
+            }
+
+            // Step 2. Heat from each cell drifts 'up' and diffuses a little
+            for (int k = numPixels - 1; k >= 2; k--) {
+              heat[k] = (heat[k - 1] + heat[k - 2] + heat[k - 2]) / 3;
+            }
+
+            // Step 3. Randomly ignite new 'sparks' of heat near the bottom
+            if (random8() < sparking) {
+              int y = random8_max(7);
+              heat[y] = qadd8(heat[y], random8_range(160, 255));
+            }
+
+            // Step 4. Map from heat cells to LED colors
+            for (int j = 0; j < numPixels; j++) {
+              // calculate color temperature
+              Color color = getHeatColor(heat[j]);
+
+              // forward the frames
+              it[j + numPixels] = color;
+              // reverse the flames
+              it[numPixels - j] = color;
+            }
+      #
+      # Red pulse.
+      #
+      - addressable_lambda:
+          name: Alarm
+          update_interval: 30ms
+          lambda: |-
+            // The original ran both ramps, 0 -> 255 and back, inside a single
+            // call. Nothing is shown between writes to the frame buffer, so only
+            // the last pass survived - the strip rendered flat black and the
+            // effect did nothing at all. The ramp has to advance one step per
+            // FRAME, which is what the counter below does.
+            //
+            // 8 per 30ms frame is ~1s per ramp, so a full pulse takes ~2s.
+            constexpr int STEP = 8;
+
+            static int level = 0;
+            static int direction = 1;
+
+            if (initial_run) {
+              level = 0;
+              direction = 1;
+            }
+
+            level += direction * STEP;
+
+            if (level >= 255) {
+              level = 255;
+              direction = -1;
+            } else if (level <= 0) {
+              level = 0;
+              direction = 1;
+            }
+
+            const Color color = Color(level, 0, 0);
+            for (int i = 0; i < it.size(); i++) {
+              it[i] = color;
+            }
+      #
+      # Sunrise ramp: a wake-up light that opens from midday outwards and warms
+      # from red through amber to daylight, then holds at full.
+      #
+      - addressable_lambda:
+          name: Dawn
+          update_interval: 1s
+          lambda: |-
+            // The original fed the raw Unix timestamp into a curve whose
+            // breakpoints (142, 204, 280) only make sense for a small progress
+            // value. Every real timestamp is astronomically larger than 280, so
+            // it took the last branch every time and overflowed the colour
+            // maths - the effect showed one arbitrary constant frame.
+            //
+            // It cannot follow the real sunrise either: that needs latitude and
+            // longitude via the sun component, which this device does not have.
+            // So it is what it always looked like - a ramp - driven by its own
+            // frame counter over DAWN_DURATION_S and restarted whenever the
+            // effect is selected.
+            constexpr int PROGRESS_END = 280;
+            constexpr int DURATION_S = ${DAWN_DURATION_S};
+
+            static int elapsed = 0;
+
+            if (initial_run) {
+              elapsed = 0;
+            }
+
+            // update_interval is 1s, so one tick is one second of the ramp
+            if (elapsed < DURATION_S) {
+              elapsed++;
+            }
+
+            // scaled rather than stepped: PROGRESS_END / DURATION_S is 0 in
+            // integer maths for any sensible duration, so incrementing would
+            // either never move or run the ramp in PROGRESS_END seconds flat
+            const int i = (int) ((long) elapsed * PROGRESS_END / DURATION_S);
+
+            int bright;
+            int green;
+            int blue = 0;
+
+            if (i < 142) {
+              bright = i * 64 / 142;
+            } else if (i >= 142 && i < 204) {
+              bright = 64 + (i - 142) * 128 / 62;
+            } else {
+              bright = 192 + (i - 204) * 64 / 51;
+            }
+
+            green = std::max(142, i);
+
+            if (i > 204) {
+              blue = (5 * i - 1020);
+            } else {
+              blue = 0;
+            }
+
+            // clamp: the curves above run past 255 at the end of the ramp, and
+            // Color takes uint8_t - without this they wrap around to dark
+            green = std::min(green, 255);
+            blue = std::min(blue, 255);
+            bright = std::min(bright, 255);
+
+            for (int j = 0; j < it.size(); j++) {
+              if (j < (i * it.size() / PROGRESS_END) || j > (it.size() - (i * it.size() / PROGRESS_END))) {
+                it[j] = Color(green, blue, bright);
+              } else {
+                it[j] = Color(0, 0, 0);
+              }
+            }
+      #
+      # Current moon phase as a lit segment.
+      #
+      - addressable_lambda:
+          name: Moon
+          # the phase moves once a day; 1s is already far more often than needed
+          update_interval: 1s
+          lambda: |-
+            auto time = id(sntp_time).now();
+
+            if (!time.is_valid()) {
+              return;
+            }
+
+            // The renderer below wants "days into the lunar cycle", 0..29. The
+            // original computed that with integer arithmetic on the raw epoch:
+            // "(timestamp - 518400) % 2551443 / 86400". Two things were wrong
+            // with it - 518400 (6 days) is not a new moon reference, and
+            // 2551443 seconds is the synodic month, so the modulo left seconds
+            // into the cycle and the division by a day gave 0..29 only by
+            // accident of the wrong epoch. It tracked nothing in the sky.
+            //
+            // Reference new moon: 2000-01-06 18:14 UTC, the standard epoch for
+            // this calculation. The synodic month is 29.530588853 days.
+            constexpr double SYNODIC_MONTH_DAYS = 29.530588853;
+            constexpr double REFERENCE_NEW_MOON = 947182440.0;
+
+            const double days = (time.timestamp - REFERENCE_NEW_MOON) / 86400.0;
+            double cycles = days / SYNODIC_MONTH_DAYS;
+            cycles -= std::floor(cycles);
+
+            // 0 = new moon, ~14.8 = full moon
+            const int phase = (int) (cycles * SYNODIC_MONTH_DAYS);
+
+            // how full is the moon based on the phase
+            int fill = it.size() * (14 - (std::abs(14 - phase))) / 14 - it.size() / 6;
+
+            // start on one side, then go back to the other
+            int startPos = it.size() / 5 + fill / 2 + it.size() / 2 * (phase > 14);
+
+            for (int i = 0; i < it.size(); i++) {
+              if (i < fill) {
+                // fill the LEDs in the zone at moon brightness
+                it[(i + 2 * it.size() - startPos) % it.size()] = Color(64, 64, 64);
+              } else {
+                // check if these LEDs are on either side of full-bright and make them semi-bright
+                int bright = std::max((int)(64 - (it.size() - i) * (64 / (it.size() / 6))), std::max(0, (int)((64 - (i - fill) * (64 / (it.size() / 6))))));
+                // add in start pos and % to offset to one side
+                it[(i + 2 * it.size() - startPos) % it.size()] = Color(bright, bright, bright);
+              }
+            }
+      - addressable_rainbow:
+      - addressable_color_wipe:
+      - addressable_scan:
+      - addressable_twinkle:
+      - addressable_random_twinkle:
+      - addressable_fireworks:
+      - addressable_flicker:
+
+    # Switching the light on always lands on the clock face at a known
+    # brightness, whatever effect or colour was last set from Home Assistant.
+    on_turn_on:
+      - light.turn_on:
+          id: led_ring_id
+          brightness: ${DEFAULT_BRIGHTNESS}
+          red: 100%
+          green: 100%
+          blue: 100%
+          effect: Time
