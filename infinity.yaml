@@ -1140,6 +1140,13 @@ light:
             static uint8_t heat[MAX_PIXELS] = {};
             static uint16_t rand16seed = 0;
 
+            // Without this the seed is 0 on every boot and the fire replays the
+            // exact same sequence of sparks each time - identical flames after
+            // every restart.
+            if (initial_run) {
+              rand16seed = (uint16_t) millis();
+            }
+
             // Generate an 8-bit random number
             auto random8 = [&]() -> uint8_t {
               rand16seed = (rand16seed * (uint16_t) 2053) + (uint16_t) 13849;
@@ -1220,16 +1227,24 @@ light:
               heat[y] = qadd8(heat[y], random8_range(160, 255));
             }
 
-            // Step 4. Map from heat cells to LED colors
+            // Step 4. Map from heat cells to LED colors, mirrored across the
+            // ring: the base sits at numPixels - 1 / numPixels and the two
+            // flames rise in opposite directions to meet at 0 / size - 1.
+            //
+            // The second index used to be numPixels - j, which covered
+            // numPixels down to 1 - so pixel 0 was never written at all and
+            // kept whatever the previous effect had left there, while pixel
+            // numPixels got written twice. The stale pixel sat exactly where
+            // the two flame tips meet, which is where it showed most.
             for (int j = 0; j < numPixels; j++) {
               // calculate color temperature, clamped short of the white end of
               // the palette - see FIRE_MAX_HEAT
               Color color = getHeatColor(std::min(heat[j], maxHeat));
 
-              // forward the frames
-              it[j + numPixels] = color;
+              // forward the flames
+              it[numPixels + j] = color;
               // reverse the flames
-              it[numPixels - j] = color;
+              it[numPixels - 1 - j] = color;
             }
       #
       # Red pulse.
