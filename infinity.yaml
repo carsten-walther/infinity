@@ -111,6 +111,23 @@ substitutions:
   MIN_FACE_BRIGHTNESS: "0.15"
 
   #
+  # Hand movement
+  #
+  # A hand does not snap to its new pixel: the new one fades in while the old
+  # one fades out, and a short tail of dimming pixels follows behind - so a
+  # second stepping from 10 to 11 reads as movement rather than as two separate
+  # states.
+  #
+  # FADE_MS is how long that step takes. It has to stay well under 1000, or the
+  # second hand would still be moving when the next second arrives.
+  #
+  # TAIL is the length of the trail in pixels. Needs a decimal point: the lambda
+  # appends "f" to build a float literal.
+  #
+  HAND_FADE_MS: "400"
+  HAND_TAIL: "3.0"
+
+  #
   # Sun effect
   #
   # Starting point for the Latitude and Longitude text entities, which is where
@@ -1350,6 +1367,14 @@ text:
 # The option ORDER is load-bearing: the Time effect switches on
 # active_index(), and its FACETYPE_* / INDICATOR_* constants are the positions
 # in these lists. Reordering or inserting an option silently remaps the face.
+# Renaming one is safe - restore_value stores the index too.
+#
+# The Indicator options name POSITIONS on the dial, not times of day. "12
+# o'clock" was "Show midday", which is wrong for half of every day: pixel 0 is
+# where both noon and midnight land. "Quarters" was "Show quadrants" - what it
+# draws are the four marks at 12, 3, 6 and 9, not the sectors between them. The
+# redundant "Show " prefix went with them, since the entity is already called
+# Indicator and the first option is plain "Off".
 #
 # restore_value on both: without it the schema default is false and every reboot
 # reset the face to Normal / Off. initial_option only applies on the very first
@@ -1383,9 +1408,9 @@ select:
     id: infinity_indicator
     options:
       - "Off"
-      - "Show midday"
-      - "Show quadrants"
-      - "Show hour marks"
+      - "12 o'clock"
+      - "Quarters"
+      - "Hour marks"
     initial_option: "Off"
     optimistic: true
     restore_value: true
@@ -1425,17 +1450,24 @@ light:
       #
       - addressable_lambda:
           name: Time
-          # 100ms, not the 500ms this used to be. The reasoning behind 500 was
-          # "the smallest thing shown is a second, so anything faster is wasted"
-          # - true of the CONTENT, wrong for the LATENCY. The display only moves
-          # on the first frame after a second boundary, so the render period is
-          # exactly how late the second hand can be, and half a second of that
-          # is plainly visible as an uneven step.
+          # 50ms, down from 500ms originally. Two reasons, and neither is the
+          # one that used to be written here ("the smallest thing shown is a
+          # second, so anything faster is wasted") - that is true of the CONTENT
+          # and wrong for everything else.
           #
-          # Still nowhere near the 0ms default, which re-rendered 60 pixels on
-          # every main-loop pass. At 10 Hz this lambda costs well under a
-          # percent of a core.
-          update_interval: 100ms
+          # Latency: the display only moves on the first frame after a second
+          # boundary, so the render period is exactly how late the second hand
+          # can be.
+          #
+          # Smoothness: the hands now fade between pixels over HAND_FADE_MS, and
+          # the render period is the step size of that fade. At 400ms fade this
+          # gives eight steps; at the old 500ms it would have given one, which
+          # is not a fade at all.
+          #
+          # Still nowhere near the 0ms default, which re-rendered on every
+          # main-loop pass. At 20 Hz this lambda costs a fraction of a percent
+          # of a core.
+          update_interval: 50ms
           lambda: |-
             // face types
             constexpr int FACETYPE_NORMAL = 0;
@@ -1443,10 +1475,10 @@ light:
             constexpr int FACETYPE_GRADIENT = 2;
 
             // indicators
-            constexpr int INDICATOR_SHOW_NONE = 0;
-            constexpr int INDICATOR_SHOW_MIDDAY = 1;
-            constexpr int INDICATOR_SHOW_QUADRANTS = 2;
-            constexpr int INDICATOR_SHOW_HOUR_MARKS = 3;
+            constexpr int INDICATOR_OFF = 0;
+            constexpr int INDICATOR_TWELVE = 1;
+            constexpr int INDICATOR_QUARTERS = 2;
+            constexpr int INDICATOR_HOUR_MARKS = 3;
 
             auto linearBlend = [](Color left, Color right, float progress) -> Color {
               return Color(left.r + ((right.r - left.r) * progress),
@@ -1614,27 +1646,107 @@ light:
               }
             }
 
-            // Drawn for every face type, and last, so the hands sit on top of
-            // the gradient rather than being blended into it.
-            it[hour_pos] = hour_color;
-            it[minute_pos] = minute_color;
+            // --- Hand movement
+            //
+            // Each hand remembers when it last stepped, and is drawn as a short
+            // comet sliding from its previous pixel to the current one: the new
+            // pixel fades in, the old fades out, and a tail of dimming pixels
+            // follows behind. Without this a hand simply teleports, which on a
+            // ring of discrete pixels reads as two separate states rather than
+            // as movement.
+            //
+            // The positions are recomputed from the clock every frame, so the
+            // only state kept here is WHEN each one last changed.
+            constexpr uint32_t FADE_MS = ${HAND_FADE_MS};
+            constexpr float TAIL = ${HAND_TAIL}f;
+
+            const uint32_t now_ms = millis();
+
+            static int last_hour_pos = -1;
+            static int last_minute_pos = -1;
+            static int last_second_pos = -1;
+            static uint32_t hour_changed_ms = 0;
+            static uint32_t minute_changed_ms = 0;
+            static uint32_t second_changed_ms = 0;
+
+            // -1 forces all three to register a step on the next line, so the
+            // hands fade in when the effect is selected instead of appearing
+            // mid-tail with a stale age behind them.
+            if (initial_run) {
+              last_hour_pos = -1;
+              last_minute_pos = -1;
+              last_second_pos = -1;
+            }
+
+            if (hour_pos != last_hour_pos) {
+              last_hour_pos = hour_pos;
+              hour_changed_ms = now_ms;
+            }
+            if (minute_pos != last_minute_pos) {
+              last_minute_pos = minute_pos;
+              minute_changed_ms = now_ms;
+            }
+            if (second != last_second_pos) {
+              last_second_pos = second;
+              second_changed_ms = now_ms;
+            }
+
+            auto fadeOf = [&](uint32_t since) -> float {
+              const uint32_t age = now_ms - since;
+              return (age >= FADE_MS) ? 1.0f : (float) age / (float) FADE_MS;
+            };
+
+            // Draws one comet. The head slides from pos-1 to pos as fade runs
+            // 0 -> 1, so d = 0 is the pixel being faded IN and everything above
+            // it is the tail being faded out.
+            //
+            // Blended into whatever is already there rather than overwriting:
+            // on the Simple face that background is black and this reads as a
+            // pure comet, on Normal and Gradient it is a highlight that melts
+            // back into the ramp.
+            auto drawHand = [&](int pos, Color color, float fade) {
+              for (int d = 0; d <= (int) TAIL + 1; d++) {
+                const float s = (float) d - 1.0f + fade;
+
+                float level;
+                if (s < 0.0f) {
+                  level = 1.0f + s;
+                } else if (s <= TAIL) {
+                  level = 1.0f - s / TAIL;
+                } else {
+                  continue;
+                }
+
+                if (level <= 0.0f) {
+                  continue;
+                }
+
+                const int i = ((pos - d) % it.size() + it.size()) % it.size();
+                it[i] = linearBlend(it[i].get(), color, level);
+              }
+            };
+
+            // Drawn for every face type, and after the background, so the hands
+            // sit on top of the gradient rather than being blended into it.
+            drawHand(hour_pos, hour_color, fadeOf(hour_changed_ms));
+            drawHand(minute_pos, minute_color, fadeOf(minute_changed_ms));
 
             // indicator
-            switch (indicator.value_or(INDICATOR_SHOW_NONE)) {
+            switch (indicator.value_or(INDICATOR_OFF)) {
               default:
                 break;
-              case INDICATOR_SHOW_NONE:
+              case INDICATOR_OFF:
                 break;
-              case INDICATOR_SHOW_MIDDAY:
-                // shows a bright light at midday to orient the user
+              case INDICATOR_TWELVE:
+                // one mark at the top of the dial, to orient the reader
                 invertLED(0);
                 break;
-              case INDICATOR_SHOW_QUADRANTS:
+              case INDICATOR_QUARTERS:
                 for (int i = 0; i < 4; i++) {
                   invertLED(i * it.size() / 4);
                 }
                 break;
-              case INDICATOR_SHOW_HOUR_MARKS:
+              case INDICATOR_HOUR_MARKS:
                 for (int i = 0; i < 12; i++) {
                   invertLED(i * it.size() / 12);
                 }
@@ -1642,7 +1754,7 @@ light:
             }
 
             if (enable_seconds) {
-              it[second] = second_color;
+              drawHand(second, second_color, fadeOf(second_changed_ms));
             }
 
             // Ambient dimming. The factor is computed once on the Brightness

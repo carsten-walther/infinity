@@ -99,6 +99,8 @@ All tunables live in `substitutions:` at the top of `infinity.yaml`:
 | `IDLE_RED` / `IDLE_GREEN` / `IDLE_BLUE` | the colour the ring carries underneath the effects |
 | `AMBIENT_DARK` / `AMBIENT_BRIGHT` | LDR divider voltage in a dark room and in full daylight |
 | `MIN_FACE_BRIGHTNESS` | how far the face may dim at night, as a fraction — never `0` |
+| `HAND_FADE_MS` | how long a hand takes to step to its next pixel |
+| `HAND_TAIL` | length of the trail behind a hand, in pixels |
 | `DEFAULT_LATITUDE` / `DEFAULT_LONGITUDE` | seed values for the `Latitude` / `Longitude` entities on first boot |
 | `SUN_WHITE_ELEVATION` | solar elevation at which `Sun` reads as plain daylight |
 | `FIRE_COOLING` / `FIRE_SPARKING` | how short and how active the `Fire` flames are |
@@ -183,7 +185,7 @@ default clock, higher receive current — and no working die sensor to measure i
 | Entity | Type | Values |
 | --- | --- | --- |
 | `Face type` | Select | `Normal`, `Simple`, `Gradient` |
-| `Indicator` | Select | `Off`, `Show midday`, `Show quadrants`, `Show hour marks` |
+| `Indicator` | Select | `Off`, `12 o'clock`, `Quarters`, `Hour marks` |
 | `Enable seconds` | Switch | shows the second hand |
 | `Color hour` / `Color minute` / `Color second` | Text | hex colour, e.g. `#FF0000` |
 | `Latitude` / `Longitude` | Text | decimal degrees, north and east positive — drives the `Sun` and `Moon` effects |
@@ -251,13 +253,38 @@ Plus the ESPHome built-ins: Rainbow, Color Wipe, Scan, Twinkle, Random Twinkle,
 Fireworks and Flicker.
 
 Each effect declares its own `update_interval`, matched to how fast it can actually
-change — 100 ms for `Time`, 30 ms for `Fire` and `Alarm`, 10 s for `Sun` and `Moon`.
+change — 50 ms for `Time`, 30 ms for `Fire` and `Alarm`, 10 s for `Sun` and `Moon`.
 Left at the ESPHome default of `0ms` a lambda re-renders all 60 pixels on every
 main-loop pass.
 
-`Time` runs at 100 ms rather than the 500 ms it once had. The render period is exactly
-how late the second hand can be — the display only moves on the first frame after a
-second boundary — and half a second of that is visible as an uneven step.
+`Time` runs at 50 ms, down from 500 ms originally, for two reasons. The render period
+is exactly how late a hand can be — the display only moves on the first frame after the
+clock changes. And it is the step size of the hand fade below: at a 400 ms fade, 50 ms
+gives eight steps, where the old 500 ms would have given one.
+
+### Hand movement
+
+Hands do not snap. Each one is drawn as a short comet sliding from its previous pixel
+to the current one over `HAND_FADE_MS`: the new pixel fades in, the old fades out, and
+a tail of dimming pixels follows behind. A second stepping from 10 to 11 looks like
+this, at 400 ms fade:
+
+| t | pixel 8 | 9 | 10 | 11 |
+| --- | --- | --- | --- | --- |
+| 0 ms | 0.33 | 0.67 | 1.00 | 0.00 |
+| 200 ms | 0.17 | 0.50 | 0.83 | 0.50 |
+| 400 ms | 0.00 | 0.33 | 0.67 | 1.00 |
+
+The trail is drawn *blended into* whatever is already on the ring rather than
+overwriting it: on `Simple` the background is black, so it reads as a pure comet; on
+`Normal` and `Gradient` it is a highlight that melts back into the ramp.
+
+Note that `HAND_TAIL` leaves a trail at rest as well as during the step — at `3.0` a
+stationary hand still has two dimmer pixels behind it. Set it to `1.0` for a pure
+crossfade with no trail between steps.
+
+`HAND_FADE_MS` has to stay well under 1000, or the second hand would still be moving
+when the next second arrives.
 
 `Sun` simulates the sun in real time. It computes the solar elevation for the
 device's own coordinates and shows it directly: dark below the horizon, one pixel at
@@ -373,7 +400,13 @@ same colour either side of any point on it.
 `Indicator` and `Enable seconds` apply to every face, so hour marks and a second dot
 work on `Simple` and `Gradient` too.
 
-The option **order** of `Face type` and `Indicator` is load-bearing: the `Time` effect
+`Indicator` marks positions on the dial — one mark at the top, four at 12/3/6/9, or all
+twelve hours. The names describe positions rather than times of day: pixel 0 is where
+both noon and midnight land, so the old `Show midday` was wrong for half of every day,
+and `Show quadrants` named the sectors when what it draws are the marks between them.
+
+The option **order** of `Face type` and `Indicator` is load-bearing (renaming is safe,
+`restore_value` stores the index too): the `Time` effect
 switches on `active_index()`, so reordering or inserting an option silently remaps the
 face.
 
