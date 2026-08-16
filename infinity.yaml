@@ -154,7 +154,7 @@ substitutions:
   #
   FIRE_COOLING: "55"
   FIRE_SPARKING: "120"
-  FIRE_MAX_HEAT: "170"
+  FIRE_MAX_HEAT: "190"
 
   #
   # Moon effect
@@ -163,6 +163,16 @@ substitutions:
   # Moonlight is meant to be dim - the whole ring at 255 is a lamp, not a moon.
   #
   MOON_BRIGHTNESS: "64"
+
+  #
+  # Alarm effect
+  #
+  # Peak colour of the pulse, 0-255 per channel. The last effect that still had
+  # its colour hard-coded.
+  #
+  ALARM_RED: "255"
+  ALARM_GREEN: "0"
+  ALARM_BLUE: "0"
 
 #
 # https://esphome.io/components/esphome
@@ -178,28 +188,18 @@ esphome:
     version: "${version}"
 
   on_boot:
-    # priority 600 runs after hardware init, so the ring is already addressable
+    # priority 600 runs after hardware init, so the ring is already addressable.
+    #
+    # Twinkle is the "waiting for the network" indicator, and it now genuinely
+    # is one: nothing switches the ring to the clock face until wifi on_connect
+    # fires. That block used to be a boot trigger at priority 200 testing
+    # wifi.connected, which could never be true - every on_boot trigger runs
+    # inside setup(), milliseconds apart, long before the radio associates.
     - priority: 600
       then:
         - light.turn_on:
             id: led_ring_id
             effect: Twinkle
-
-    # NOTE: this block is effectively dead and kept only to document that.
-    # Every on_boot trigger fires during setup(), milliseconds apart - the
-    # priorities order them, they do not space them out in time. WiFi has not
-    # associated yet at this point, so the condition is false on every boot and
-    # the Twinkle above is never the "waiting for network" indicator it looks
-    # like. Doing that properly needs a wifi on_connect / on_disconnect trigger,
-    # not a boot priority.
-    - priority: 200
-      then:
-        if:
-          condition:
-            wifi.connected:
-          then:
-            - light.turn_off:
-                id: led_ring_id
 
     # Negative priority runs after every component is set up, which is what both
     # of these need: the light has to exist before an effect can be selected,
@@ -217,13 +217,6 @@ esphome:
 
     - priority: -100
       then:
-        - light.turn_on:
-            id: led_ring_id
-            brightness: ${DEFAULT_BRIGHTNESS}
-            red: ${IDLE_RED}
-            green: ${IDLE_GREEN}
-            blue: ${IDLE_BLUE}
-            effect: Time
         # Both are pushed rather than polled: the version string is a compile-time
         # constant and the reset count changes once per boot, so an interval could
         # only republish an unchanged value - publish_state does not deduplicate.
@@ -295,6 +288,27 @@ wifi:
 
   enable_on_boot: True
 
+  # Leaves the boot indicator and shows the clock, once - and only if the ring
+  # is still on Twinkle. Guarding on that matters: on_connect fires again after
+  # every reconnect, and a clock that jumps back to the time face because the
+  # access point hiccupped would undo whatever was selected in Home Assistant.
+  #
+  # There is deliberately no on_disconnect counterpart. The clock runs off the
+  # system clock, not off the network, so losing WiFi is no reason to stop
+  # showing the time.
+  on_connect:
+    - if:
+        condition:
+          lambda: return id(led_ring_id).get_effect_name().str() == "Twinkle";
+        then:
+          - light.turn_on:
+              id: led_ring_id
+              brightness: ${DEFAULT_BRIGHTNESS}
+              red: ${IDLE_RED}
+              green: ${IDLE_GREEN}
+              blue: ${IDLE_BLUE}
+              effect: Time
+
   # Reduced from the ~20 dBm default. Barely moves the power budget - this node
   # transmits well under 0.1% of the time - but it does no harm either. Do not
   # go lower: at this RSSI a weaker uplink means retransmits, and those cost
@@ -319,6 +333,24 @@ ota:
   #
   - platform: esphome
     password: !secret ota_password
+    # The ring is not idle while an update runs: the effect lambdas and the RMT
+    # transfers compete with it for CPU and for the WiFi stack. Parking the
+    # light for the duration is free insurance, and matters more now that the
+    # radio sleeps between beacons.
+    on_begin:
+      then:
+        - light.turn_off: led_ring_id
+    # A failed update does not reboot, so put the clock back.
+    on_error:
+      then:
+        - light.turn_on:
+            id: led_ring_id
+            effect: Time
+    on_abort:
+      then:
+        - light.turn_on:
+            id: led_ring_id
+            effect: Time
 
 #
 # https://esphome.io/components/api
@@ -357,11 +389,25 @@ web_server:
   # assets served from flash instead of a CDN, so the page also works while the
   # WiFi has no route to the internet - e.g. from the fallback access point
   local: True
+  # Without this anyone on the LAN can drive the ring - and reach the Factory
+  # Reset button, which clears the WiFi credentials. The credentials were
+  # already sitting unused in secrets.yaml.
+  auth:
+    username: !secret web_username
+    password: !secret web_password
 
 #
 # https://esphome.io/components/time
 #
+# Two sources, one system clock: whichever sets it first makes every time
+# component valid, so the effects keep reading id(sntp_time) either way. SNTP
+# needs a route to the internet; the Home Assistant import only needs Home
+# Assistant, which covers the case where the uplink is down but the LAN is fine.
+#
 time:
+  - platform: homeassistant
+    id: ha_time
+
   - platform: sntp
     id: sntp_time
     timezone: Europe/Berlin
@@ -422,6 +468,217 @@ globals:
     type: int
     restore_value: yes
     initial_value: '0'
+
+  #
+  # Ambient dim factor, 0..1, recomputed whenever the Brightness sensor
+  # publishes. Every effect that should follow the room light multiplies its
+  # finished frame by this - the mapping from volts to a factor lives once, on
+  # the sensor, instead of once per effect.
+  #
+  - id: global_ambient_dim
+    type: float
+    restore_value: no
+    initial_value: '1.0f'
+
+  #
+  # Sky, filled by the astronomy interval below. NAN means "not computed yet",
+  # which is also what the effects see before the clock has a valid time.
+  #
+  # These exist so the position maths runs ONCE per tick instead of once per
+  # effect frame: the Sun and Moon effects both need the sun, and the diagnostic
+  # sensors need both. Three copies of the same trigonometry would be three
+  # chances to fix a bug in only two of them.
+  #
+  - id: global_sun_elevation
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: global_sun_max_elevation
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: global_moon_altitude
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: global_moon_illuminated
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: global_moon_waxing
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+#
+# The one place solar and lunar position are computed. Runs on its own clock so
+# the effect lambdas stay cheap: they read globals and draw.
+#
+# 10s is far more often than anything here changes - the sun moves 0.004 deg/s,
+# the moon half a degree an hour - but it keeps the ring responsive at sunrise
+# and moonrise without putting double-precision trigonometry on a render path.
+#
+# https://esphome.io/components/interval
+#
+interval:
+  - interval: 10s
+    then:
+      - lambda: |-
+          auto time = id(sntp_time).now();
+
+          if (!time.is_valid()) {
+            id(global_sun_elevation) = NAN;
+            id(global_sun_max_elevation) = NAN;
+            id(global_moon_altitude) = NAN;
+            id(global_moon_illuminated) = NAN;
+            return;
+          }
+
+          // Coordinates live in the text entities; parsed here, once, rather
+          // than in each effect. Anything unparseable or out of range falls
+          // back to the compiled default.
+          auto parseCoord = [](const std::string &str, float fallback, float limit) -> float {
+            if (str.empty()) {
+              return fallback;
+            }
+            char *end = nullptr;
+            const float v = strtof(str.c_str(), &end);
+            if (end == str.c_str() || !std::isfinite(v) || v < -limit || v > limit) {
+              return fallback;
+            }
+            return v;
+          };
+
+          const double obsLat = parseCoord(id(latitude_text_id).state, ${DEFAULT_LATITUDE}f, 90.0f);
+          const double obsLon = parseCoord(id(longitude_text_id).state, ${DEFAULT_LONGITUDE}f, 180.0f);
+
+          constexpr double DEG = 0.017453292519943295;
+          constexpr double RAD = 57.29577951308232;
+
+          auto sind = [DEG](double a) { return std::sin(a * DEG); };
+          auto cosd = [DEG](double a) { return std::cos(a * DEG); };
+          auto rev = [](double a) {
+            const double r = std::fmod(a, 360.0);
+            return (r < 0.0) ? r + 360.0 : r;
+          };
+
+          // Days since 2000 Jan 0.0 TDT, the epoch these orbital elements are
+          // referenced to (Schlyter). Cross-checked against the Astronomical
+          // Almanac's low-precision solar formula: they agree to 0.003 degrees
+          // over a full year, so one set of elements serves both bodies.
+          const double d = (double) time.timestamp / 86400.0 - 10956.0;
+
+          const double obliq = 23.4393 - 3.563e-7 * d;
+          const double utHours = std::fmod((double) time.timestamp / 3600.0, 24.0);
+
+          // --- Sun
+          const double sunW = 282.9404 + 4.70935e-5 * d;
+          const double sunE = 0.016709 - 1.151e-9 * d;
+          const double sunM = rev(356.0470 + 0.9856002585 * d);
+
+          const double sunEcc = sunM + sunE * RAD * sind(sunM) * (1.0 + sunE * cosd(sunM));
+          const double sunLon = rev(std::atan2(std::sqrt(1.0 - sunE * sunE) * sind(sunEcc),
+                                               cosd(sunEcc) - sunE) * RAD + sunW);
+          const double sunMeanLon = rev(sunM + sunW);
+
+          // Local sidereal time, needed for both bodies' hour angles.
+          const double lst = rev(sunMeanLon + 180.0 + utHours * 15.0 + obsLon);
+
+          const double sunDec = std::asin(sind(obliq) * sind(sunLon)) * RAD;
+          const double sunRa = std::atan2(cosd(obliq) * sind(sunLon), cosd(sunLon)) * RAD;
+          const double sunHa = rev(lst - sunRa);
+
+          id(global_sun_elevation) = (float) (std::asin(sind(obsLat) * sind(sunDec) +
+                                                        cosd(obsLat) * cosd(sunDec) * cosd(sunHa)) * RAD);
+
+          // At solar noon the hour angle is 0 and the elevation reduces to
+          // this. Normalising the Sun effect's arc against it means the ring
+          // closes at local noon on any day of the year, not only in midsummer.
+          id(global_sun_max_elevation) = (float) (90.0 - std::fabs(obsLat - sunDec));
+
+          // --- Moon
+          const double moonN = 125.1228 - 0.0529538083 * d;
+          const double moonI = 5.1454;
+          const double moonW = 318.0634 + 0.1643573223 * d;
+          const double moonA = 60.2666;
+          const double moonEcc = 0.054900;
+          const double moonM = rev(115.3654 + 13.0649929509 * d);
+
+          double E = moonM + moonEcc * RAD * sind(moonM) * (1.0 + moonEcc * cosd(moonM));
+          E = E - (E - moonEcc * RAD * sind(E) - moonM) / (1.0 - moonEcc * cosd(E));
+
+          const double mx = moonA * (cosd(E) - moonEcc);
+          const double my = moonA * std::sqrt(1.0 - moonEcc * moonEcc) * sind(E);
+          const double moonR = std::sqrt(mx * mx + my * my);
+          const double vw = std::atan2(my, mx) * RAD + moonW;
+
+          const double xeclip = moonR * (cosd(moonN) * cosd(vw) - sind(moonN) * sind(vw) * cosd(moonI));
+          const double yeclip = moonR * (sind(moonN) * cosd(vw) + cosd(moonN) * sind(vw) * cosd(moonI));
+          const double zeclip = moonR * sind(vw) * sind(moonI);
+
+          double moonLon = std::atan2(yeclip, xeclip) * RAD;
+          double moonLat = std::atan2(zeclip, std::sqrt(xeclip * xeclip + yeclip * yeclip)) * RAD;
+
+          // The moon's orbit is badly behaved. The evection term alone is 1.27
+          // degrees, which is several minutes of moonrise, so these are not
+          // decoration.
+          const double Lm = rev(moonM + moonW + moonN);
+          const double Dm = rev(Lm - sunMeanLon);
+          const double Fm = rev(Lm - moonN);
+
+          moonLon += -1.274 * sind(moonM - 2.0 * Dm)
+                   +  0.658 * sind(2.0 * Dm)
+                   -  0.186 * sind(sunM)
+                   -  0.059 * sind(2.0 * moonM - 2.0 * Dm)
+                   -  0.057 * sind(moonM - 2.0 * Dm + sunM)
+                   +  0.053 * sind(moonM + 2.0 * Dm)
+                   +  0.046 * sind(2.0 * Dm - sunM)
+                   +  0.041 * sind(moonM - sunM)
+                   -  0.035 * sind(Dm)
+                   -  0.031 * sind(moonM + sunM)
+                   -  0.015 * sind(2.0 * Fm - 2.0 * Dm)
+                   +  0.011 * sind(moonM - 4.0 * Dm);
+
+          moonLat += -0.173 * sind(Fm - 2.0 * Dm)
+                   -  0.055 * sind(moonM - Fm - 2.0 * Dm)
+                   -  0.046 * sind(moonM + Fm - 2.0 * Dm)
+                   +  0.033 * sind(Fm + 2.0 * Dm)
+                   +  0.017 * sind(2.0 * moonM + Fm);
+
+          moonLon = rev(moonLon);
+
+          // Phase from the true elongation between moon and sun, not from a
+          // mean synodic month: the moon runs up to six degrees ahead of and
+          // behind its mean motion, worth half a day at the extremes.
+          const double elongation = rev(moonLon - sunLon);
+          id(global_moon_illuminated) = (float) ((1.0 - cosd(elongation)) / 2.0);
+          id(global_moon_waxing) = elongation < 180.0;
+
+          const double xg = cosd(moonLon) * cosd(moonLat);
+          const double yg = sind(moonLon) * cosd(moonLat);
+          const double zg = sind(moonLat);
+
+          const double ye = yg * cosd(obliq) - zg * sind(obliq);
+          const double ze = yg * sind(obliq) + zg * cosd(obliq);
+
+          const double moonRa = std::atan2(ye, xg) * RAD;
+          const double moonDec = std::atan2(ze, std::sqrt(xg * xg + ye * ye)) * RAD;
+          const double moonHa = rev(lst - moonRa);
+
+          double moonAlt = std::asin(sind(obsLat) * sind(moonDec) +
+                                     cosd(obsLat) * cosd(moonDec) * cosd(moonHa)) * RAD;
+
+          // The moon is near enough that where you stand on the Earth moves it
+          // by about a degree - several minutes either side of moonrise.
+          moonAlt -= std::asin(1.0 / moonR) * RAD * cosd(moonAlt);
+
+          id(global_moon_altitude) = (float) moonAlt;
+
+      - component.update: sun_elevation_id
+      - component.update: moon_altitude_id
+      - component.update: moon_illumination_id
+      - component.update: moon_phase_id
+
 
 #
 # https://esphome.io/components/text_sensor
@@ -510,6 +767,39 @@ text_sensor:
             snprintf(buf, sizeof(buf), "%ds", seconds);
           }
           return {buf};
+
+  #
+  # Moon Phase
+  #
+  # The eight conventional names, from the illuminated fraction and the waxing
+  # flag. Boundaries are the usual ones: under 2% reads as new, over 98% as
+  # full, and the quarters sit within 2% of half.
+  #
+  - platform: template
+    id: moon_phase_id
+    name: Moon Phase
+    icon: mdi:moon-waning-crescent
+    entity_category: diagnostic
+    update_interval: never
+    lambda: |-
+      const float f = id(global_moon_illuminated);
+      if (std::isnan(f)) {
+        return {"Unknown"};
+      }
+      if (f < 0.02f) {
+        return {"New moon"};
+      }
+      if (f > 0.98f) {
+        return {"Full moon"};
+      }
+      const bool waxing = id(global_moon_waxing);
+      if (f > 0.48f && f < 0.52f) {
+        return {waxing ? "First quarter" : "Last quarter"};
+      }
+      if (f < 0.5f) {
+        return {waxing ? "Waxing crescent" : "Waning crescent"};
+      }
+      return {waxing ? "Waxing gibbous" : "Waning gibbous"};
 
   #
   # WiFi Information
@@ -668,6 +958,50 @@ sensor:
           call.perform();
 
   #
+  # Sky, straight from the astronomy interval. These cost nothing to expose -
+  # the values are computed anyway - and they turn the clock into a usable
+  # source for automations without needing an integration for it.
+  #
+  # update_interval: never - pushed by the interval that computes them, so they
+  # cannot report a value the ring is not showing.
+  #
+  - platform: template
+    id: sun_elevation_id
+    name: Sun Elevation
+    icon: mdi:weather-sunny
+    unit_of_measurement: "°"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: never
+    lambda: |-
+      return id(global_sun_elevation);
+
+  - platform: template
+    id: moon_altitude_id
+    name: Moon Altitude
+    icon: mdi:weather-night
+    unit_of_measurement: "°"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: never
+    lambda: |-
+      return id(global_moon_altitude);
+
+  - platform: template
+    id: moon_illumination_id
+    name: Moon Illumination
+    icon: mdi:moon-waning-crescent
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: never
+    lambda: |-
+      if (std::isnan(id(global_moon_illuminated))) {
+        return NAN;
+      }
+      return id(global_moon_illuminated) * 100.0f;
+
+  #
   # https://esphome.io/components/sensor/internal_temperature
   #
   - platform: internal_temperature
@@ -746,6 +1080,19 @@ sensor:
       - sliding_window_moving_average:
           window_size: 20
           send_every: 5
+    # The volts-to-dim-factor mapping lives here, once, instead of once per
+    # effect. Swapping AMBIENT_DARK and AMBIENT_BRIGHT inverts it, which is the
+    # documented fix for a divider wired the other way round - the subtraction
+    # handles a negative span on its own.
+    on_value:
+      - lambda: |-
+          if (std::isnan(x)) {
+            return;
+          }
+          const float span = ${AMBIENT_BRIGHT}f - ${AMBIENT_DARK}f;
+          float t = (span == 0.0f) ? 1.0f : (x - ${AMBIENT_DARK}f) / span;
+          t = std::min(std::max(t, 0.0f), 1.0f);
+          id(global_ambient_dim) = ${MIN_FACE_BRIGHTNESS}f + (1.0f - ${MIN_FACE_BRIGHTNESS}f) * t;
 
   #
   # Reset Count
@@ -765,9 +1112,52 @@ sensor:
       return id(reset_count_id);
 
 #
+# https://esphome.io/components/datetime/template
+#
+# Turns the Alarm effect from something you pick by hand into an actual alarm.
+# The trigger fires on the local wall clock, so it follows the sntp timezone.
+#
+# type: TIME, not DATETIME: an alarm clock repeats daily, and a date would mean
+# re-arming it every night.
+#
+datetime:
+  - platform: template
+    id: alarm_time_id
+    name: Alarm Time
+    icon: mdi:alarm
+    type: TIME
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: "07:00:00"
+    on_time:
+      - if:
+          condition:
+            switch.is_on: alarm_enabled_id
+          then:
+            # turn_on rather than only setting the effect: the ring may well be
+            # off at the time, which is rather the point of an alarm.
+            - light.turn_on:
+                id: led_ring_id
+                brightness: 100%
+                effect: Alarm
+
+#
 # https://esphome.io/components/switch/template
 #
 switch:
+
+  #
+  # Arms the Alarm Time trigger. Separate from the time itself so the alarm can
+  # be silenced for a night without losing the setting.
+  #
+  - platform: template
+    name: Alarm Enabled
+    icon: mdi:alarm-check
+    id: alarm_enabled_id
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
 
   #
   # Kept optimistic on purpose: the state lives in global_enable_seconds, which
@@ -819,7 +1209,7 @@ text:
     entity_category: config
     min_length: 7
     max_length: 7
-    initial_value: '#FF0000'
+    initial_value: '#FF14C0'
 
   - platform: template
     name: Color minute
@@ -831,7 +1221,7 @@ text:
     entity_category: config
     min_length: 7
     max_length: 7
-    initial_value: '#00FF00'
+    initial_value: '#63D460'
 
   - platform: template
     name: Color second
@@ -935,6 +1325,11 @@ select:
   # which is handled before that and translated in both directions by the
   # light's on_state handler.
   #
+  # THIS LIST IS MAINTAINED BY HAND. ESPHome cannot generate it from the light's
+  # effects, so adding an effect down there without adding it here leaves it
+  # reachable only from the LED color entity, and a typo leaves an option that
+  # silently does nothing. The matching note sits on the light's effects block.
+  #
   - platform: template
     name: Effect
     icon: mdi:auto-fix
@@ -1007,6 +1402,9 @@ light:
 
     effects:
 
+      # Adding or renaming anything here means updating the Effect select's
+      # option list too - it is a hand-maintained copy of these names.
+
       #
       # The clock face. Hour and minute hand are drawn as a gradient around the
       # ring, so the two arcs between them carry the reading even when a hand
@@ -1075,10 +1473,17 @@ light:
             int minute = time.minute;
             int second = time.second;
 
+            // Blank rather than a bare return. Returning left the previous
+            // frame standing, so a device that came up without a clock showed
+            // the idle colour at full brightness and looked like a working
+            // lamp - the one failure mode that must not look like success.
             if (!time.is_valid()) {
               if (id(global_debug) < 1) {
                 ESP_LOGE("lambda", "Got invalid time from sntp_time. Time is: %i:%i", hour, minute);
                 id(global_debug) = 1;
+              }
+              for (int k = 0; k < it.size(); k++) {
+                it[k] = Color(0, 0, 0);
               }
               return;
             }
@@ -1202,30 +1607,17 @@ light:
               it[second] = second_color;
             }
 
-            // Ambient dimming, applied once over the finished frame. Doing it
-            // here rather than per-draw is what the four separate ToDo markers
-            // in this lambda used to ask for, and it is also more correct: the
-            // gradient, both hands and the inverted indicator pixels all go
-            // through the same factor, so the face keeps its contrast as it
-            // dims instead of the indicators staying bright against a dark ring.
-            //
-            // NaN until the adc has published once - leave the frame alone then
-            // rather than multiplying by garbage.
-            const float ambient = id(brightness_sensor).state;
-            if (!std::isnan(ambient)) {
-              // Swapping AMBIENT_DARK and AMBIENT_BRIGHT inverts this mapping,
-              // which is the documented fix for a divider wired the other way
-              // round - the subtraction handles a negative span on its own.
-              const float span = ${AMBIENT_BRIGHT}f - ${AMBIENT_DARK}f;
-              float t = (span == 0.0f) ? 1.0f : (ambient - ${AMBIENT_DARK}f) / span;
-              t = std::min(std::max(t, 0.0f), 1.0f);
-
-              const float dim = ${MIN_FACE_BRIGHTNESS}f + (1.0f - ${MIN_FACE_BRIGHTNESS}f) * t;
-              for (int i = 0; i < it.size(); i++) {
-                const Color c = it[i].get();
-                it[i] = Color(c.r * dim, c.g * dim, c.b * dim);
+            // Ambient dimming. The factor is computed once on the Brightness
+            // sensor - see global_ambient_dim - so every effect that follows
+            // the room light applies it the same way.
+            const float dim = id(global_ambient_dim);
+            if (dim < 0.999f) {
+              for (int k = 0; k < it.size(); k++) {
+                const Color c = it[k].get();
+                it[k] = Color(c.r * dim, c.g * dim, c.b * dim);
               }
             }
+
       #
       # Fire simulation, mirrored across both halves of the ring.
       #
@@ -1361,6 +1753,17 @@ light:
               // reverse the flames
               it[numPixels - 1 - j] = color;
             }
+
+            // Ambient dimming. The factor is computed once on the Brightness
+            // sensor - see global_ambient_dim - so every effect that follows
+            // the room light applies it the same way.
+            const float dim = id(global_ambient_dim);
+            if (dim < 0.999f) {
+              for (int k = 0; k < it.size(); k++) {
+                const Color c = it[k].get();
+                it[k] = Color(c.r * dim, c.g * dim, c.b * dim);
+              }
+            }
       #
       # Red pulse.
       #
@@ -1395,7 +1798,10 @@ light:
               direction = 1;
             }
 
-            const Color color = Color(level, 0, 0);
+            // Deliberately NOT dimmed by global_ambient_dim, unlike every
+            // other effect here: an alarm that turns itself down in a dark room
+            // is an alarm that fails at the one time it is needed.
+            const Color color = Color(${ALARM_RED} * level, ${ALARM_GREEN} * level, ${ALARM_BLUE} * level);
             for (int i = 0; i < it.size(); i++) {
               it[i] = color;
             }
@@ -1417,92 +1823,28 @@ light:
           # point trigonometry in the config.
           update_interval: 10s
           lambda: |-
-            auto time = id(sntp_time).now();
+            // Position comes from the astronomy interval, so this lambda only
+            // has to draw. NAN means the clock has no time yet.
+            const float elevation = id(global_sun_elevation);
+            const float maxElevation = id(global_sun_max_elevation);
 
-            if (!time.is_valid()) {
-              for (int i = 0; i < it.size(); i++) {
-                it[i] = Color(0, 0, 0);
+            // below the horizon, or no clock: there is no sun to show
+            if (std::isnan(elevation) || elevation <= 0.0f) {
+              for (int j = 0; j < it.size(); j++) {
+                it[j] = Color(0, 0, 0);
               }
               return;
             }
 
-            // Reads a coordinate from its text entity. Anything unparseable,
-            // out of range or non-finite falls back to the compiled default -
-            // this runs every frame, so it must never throw the frame away.
-            auto parseCoord = [](const std::string &s, float fallback, float limit) -> float {
-              if (s.empty()) {
-                return fallback;
-              }
-              char *end = nullptr;
-              const float v = strtof(s.c_str(), &end);
-              if (end == s.c_str() || !std::isfinite(v) || v < -limit || v > limit) {
-                return fallback;
-              }
-              return v;
-            };
-
-            const double lat = parseCoord(id(latitude_text_id).state, ${DEFAULT_LATITUDE}f, 90.0f);
-            const double lon = parseCoord(id(longitude_text_id).state, ${DEFAULT_LONGITUDE}f, 180.0f);
-
-            constexpr double DEG = 0.017453292519943295;
-            constexpr double RAD = 57.29577951308232;
-
-            // Low-precision solar position from the Astronomical Almanac. Good
-            // to well under a tenth of a degree, which is a hundred times finer
-            // than one pixel of this ring.
-            //
-            // timestamp is UTC, which is what this needs - the Europe/Berlin
-            // timezone on the sntp component only affects the clock face.
-            const double jd = (double) time.timestamp / 86400.0 + 2440587.5;
-            const double n = jd - 2451545.0;
-
-            double meanLong = std::fmod(280.460 + 0.9856474 * n, 360.0);
-            double meanAnom = std::fmod(357.528 + 0.9856003 * n, 360.0);
-            if (meanLong < 0.0) meanLong += 360.0;
-            if (meanAnom < 0.0) meanAnom += 360.0;
-
-            // ecliptic longitude, with the two largest terms of the equation of centre
-            const double eclLong = meanLong + 1.915 * std::sin(meanAnom * DEG)
-                                            + 0.020 * std::sin(2.0 * meanAnom * DEG);
-            const double obliq = 23.439 - 0.0000004 * n;
-
-            const double decl = std::asin(std::sin(obliq * DEG) * std::sin(eclLong * DEG)) * RAD;
-            const double ra = std::atan2(std::cos(obliq * DEG) * std::sin(eclLong * DEG),
-                                         std::cos(eclLong * DEG)) * RAD;
-
-            double gmst = std::fmod(18.697374558 + 24.06570982441908 * n, 24.0);
-            if (gmst < 0.0) gmst += 24.0;
-
-            double hourAngle = std::fmod(gmst * 15.0 + lon - ra, 360.0);
-            if (hourAngle < -180.0) hourAngle += 360.0;
-            if (hourAngle > 180.0) hourAngle -= 360.0;
-
-            const double elevation = std::asin(std::sin(lat * DEG) * std::sin(decl * DEG) +
-                                               std::cos(lat * DEG) * std::cos(decl * DEG) *
-                                               std::cos(hourAngle * DEG)) * RAD;
-
-            // below the horizon there is no sun to show
-            if (elevation <= 0.0) {
-              for (int i = 0; i < it.size(); i++) {
-                it[i] = Color(0, 0, 0);
-              }
-              return;
-            }
-
-            // How high the sun gets today at this latitude: at solar noon the
-            // hour angle is 0 and the elevation works out to 90 - |lat - decl|.
-            // Normalising against it means the ring closes at local noon on any
-            // day of the year, rather than only in midsummer.
-            const double maxElevation = 90.0 - std::fabs(lat - decl);
-            const float spread = (maxElevation > 0.0)
-                                   ? (float) std::min(elevation / maxElevation, 1.0)
+            const float spread = (maxElevation > 0.0f)
+                                   ? std::min(elevation / maxElevation, 1.0f)
                                    : 0.0f;
 
-            // Colour by elevation, over the same red - orange - yellow - white
-            // curve the old ramp used. Its segment boundaries at 142, 204 and
-            // 280 are what give the sunrise its shape, so they are kept and only
-            // the input changed: elevation instead of a frame counter.
-            const int i = (int) (std::min(elevation / ${SUN_WHITE_ELEVATION}f, 1.0) * 280.0);
+            // Colour by elevation, over the red - orange - yellow - white curve
+            // the original ramp used. Its segment boundaries at 142, 204 and
+            // 280 are what give the sunrise its shape, so they are kept and
+            // only the input changed: elevation instead of a frame counter.
+            const int i = (int) (std::min(elevation / ${SUN_WHITE_ELEVATION}f, 1.0f) * 280.0f);
 
             int red_ramp = std::max(142, i);
 
@@ -1524,23 +1866,29 @@ light:
             const Color sky = Color(red_ramp, green_ramp, blue_ramp);
 
             // The arc is centred on pixel 0 - 12 o'clock - and opens both ways.
-            // Same antialiased edge as the Moon effect: the boundary pixel is
-            // dimmed by the fractional part, so the light creeps outwards
-            // smoothly instead of stepping a whole pixel at a time, and the +1
-            // closes the ring at noon instead of leaving the pixel opposite
-            // dark.
+            // The boundary pixel is dimmed by the fractional part so the light
+            // creeps outwards smoothly, and the +1 closes the ring at noon
+            // instead of leaving the pixel opposite dark.
             const float half = spread * (float) it.size() / 2.0f;
 
             for (int j = 0; j < it.size(); j++) {
-              int d = j;
-              if (d > it.size() / 2) {
-                d = it.size() - d;
+              int dist = j;
+              if (dist > it.size() / 2) {
+                dist = it.size() - dist;
               }
 
-              const float level = std::min(std::max(half - (float) d + 1.0f, 0.0f), 1.0f);
+              const float level = std::min(std::max(half - (float) dist + 1.0f, 0.0f), 1.0f);
               it[j] = Color(sky.r * level, sky.g * level, sky.b * level);
             }
 
+            // Ambient dimming, see global_ambient_dim.
+            const float dim = id(global_ambient_dim);
+            if (dim < 0.999f) {
+              for (int k = 0; k < it.size(); k++) {
+                const Color c = it[k].get();
+                it[k] = Color(c.r * dim, c.g * dim, c.b * dim);
+              }
+            }
       #
       # Current moon phase as a lit segment.
       #
@@ -1551,151 +1899,15 @@ light:
           # heaviest maths in this config off the hot path.
           update_interval: 10s
           lambda: |-
-            auto time = id(sntp_time).now();
-
-            // Blank rather than bare return: without a clock there is nothing
-            // to draw, and leaving the previous effect's pixels standing would
-            // be worse than darkness.
-            if (!time.is_valid()) {
-              for (int j = 0; j < it.size(); j++) {
-                it[j] = Color(0, 0, 0);
-              }
-              return;
-            }
-
-            // Same coordinate parsing as the Sun effect. Duplicated rather
-            // than shared because ESPHome lambdas have no common scope for a
-            // helper - the alternative would be a global, which is worse.
-            auto parseCoord = [](const std::string &s, float fallback, float limit) -> float {
-              if (s.empty()) {
-                return fallback;
-              }
-              char *end = nullptr;
-              const float v = strtof(s.c_str(), &end);
-              if (end == s.c_str() || !std::isfinite(v) || v < -limit || v > limit) {
-                return fallback;
-              }
-              return v;
-            };
-
-            const double obsLat = parseCoord(id(latitude_text_id).state, ${DEFAULT_LATITUDE}f, 90.0f);
-            const double obsLon = parseCoord(id(longitude_text_id).state, ${DEFAULT_LONGITUDE}f, 180.0f);
-
-            constexpr double DEG = 0.017453292519943295;
-            constexpr double RAD = 57.29577951308232;
-
-            auto sind = [DEG](double a) { return std::sin(a * DEG); };
-            auto cosd = [DEG](double a) { return std::cos(a * DEG); };
-            auto rev = [](double a) {
-              const double r = std::fmod(a, 360.0);
-              return (r < 0.0) ? r + 360.0 : r;
-            };
-
-            // Days since 2000 Jan 0.0 TDT, the epoch the orbital elements below
-            // are referenced to.
-            const double d = (double) time.timestamp / 86400.0 - 10956.0;
-
-            // The sun is needed twice over: for the elongation that gives the
-            // phase, and for the sidereal time that gives the hour angle.
-            const double sunW = 282.9404 + 4.70935e-5 * d;
-            const double sunE = 0.016709 - 1.151e-9 * d;
-            const double sunM = rev(356.0470 + 0.9856002585 * d);
-
-            const double sunEcc = sunM + sunE * RAD * sind(sunM) * (1.0 + sunE * cosd(sunM));
-            const double sunLon = rev(std::atan2(std::sqrt(1.0 - sunE * sunE) * sind(sunEcc),
-                                                 cosd(sunEcc) - sunE) * RAD + sunW);
-            const double sunMeanLon = rev(sunM + sunW);
-
-            // Moon, from its orbital elements. One Newton step on Kepler's
-            // equation is plenty at this eccentricity.
-            const double moonN = 125.1228 - 0.0529538083 * d;
-            const double moonI = 5.1454;
-            const double moonW = 318.0634 + 0.1643573223 * d;
-            const double moonA = 60.2666;
-            const double moonEcc = 0.054900;
-            const double moonM = rev(115.3654 + 13.0649929509 * d);
-
-            double E = moonM + moonEcc * RAD * sind(moonM) * (1.0 + moonEcc * cosd(moonM));
-            E = E - (E - moonEcc * RAD * sind(E) - moonM) / (1.0 - moonEcc * cosd(E));
-
-            const double mx = moonA * (cosd(E) - moonEcc);
-            const double my = moonA * std::sqrt(1.0 - moonEcc * moonEcc) * sind(E);
-            const double moonR = std::sqrt(mx * mx + my * my);
-            const double vw = std::atan2(my, mx) * RAD + moonW;
-
-            const double xeclip = moonR * (cosd(moonN) * cosd(vw) - sind(moonN) * sind(vw) * cosd(moonI));
-            const double yeclip = moonR * (sind(moonN) * cosd(vw) + cosd(moonN) * sind(vw) * cosd(moonI));
-            const double zeclip = moonR * sind(vw) * sind(moonI);
-
-            double moonLon = std::atan2(yeclip, xeclip) * RAD;
-            double moonLat = std::atan2(zeclip, std::sqrt(xeclip * xeclip + yeclip * yeclip)) * RAD;
-
-            // Perturbations. The moon's orbit is badly behaved - the evection
-            // term alone is 1.27 degrees, which is several minutes of moonrise,
-            // so leaving them out would defeat the point of computing this at
-            // all.
-            const double Lm = rev(moonM + moonW + moonN);
-            const double Dm = rev(Lm - sunMeanLon);
-            const double Fm = rev(Lm - moonN);
-
-            moonLon += -1.274 * sind(moonM - 2.0 * Dm)
-                     +  0.658 * sind(2.0 * Dm)
-                     -  0.186 * sind(sunM)
-                     -  0.059 * sind(2.0 * moonM - 2.0 * Dm)
-                     -  0.057 * sind(moonM - 2.0 * Dm + sunM)
-                     +  0.053 * sind(moonM + 2.0 * Dm)
-                     +  0.046 * sind(2.0 * Dm - sunM)
-                     +  0.041 * sind(moonM - sunM)
-                     -  0.035 * sind(Dm)
-                     -  0.031 * sind(moonM + sunM)
-                     -  0.015 * sind(2.0 * Fm - 2.0 * Dm)
-                     +  0.011 * sind(moonM - 4.0 * Dm);
-
-            moonLat += -0.173 * sind(Fm - 2.0 * Dm)
-                     -  0.055 * sind(moonM - Fm - 2.0 * Dm)
-                     -  0.046 * sind(moonM + Fm - 2.0 * Dm)
-                     +  0.033 * sind(Fm + 2.0 * Dm)
-                     +  0.017 * sind(2.0 * moonM + Fm);
-
-            moonLon = rev(moonLon);
-
-            // Phase from the true elongation between moon and sun. This
-            // replaces a mean synodic month, which ignored that the moon runs
-            // up to six degrees ahead of and behind its mean motion - worth
-            // half a day at the extremes.
-            const double elongation = rev(moonLon - sunLon);
-            const float illuminated = (float) ((1.0 - cosd(elongation)) / 2.0);
-            const bool waxing = elongation < 180.0;
-
-            // Altitude, to know whether the moon is up at all.
-            const double obliq = 23.4393 - 3.563e-7 * d;
-
-            const double xg = cosd(moonLon) * cosd(moonLat);
-            const double yg = sind(moonLon) * cosd(moonLat);
-            const double zg = sind(moonLat);
-
-            const double ye = yg * cosd(obliq) - zg * sind(obliq);
-            const double ze = yg * sind(obliq) + zg * cosd(obliq);
-
-            const double ra = std::atan2(ye, xg) * RAD;
-            const double dec = std::atan2(ze, std::sqrt(xg * xg + ye * ye)) * RAD;
-
-            const double utHours = std::fmod((double) time.timestamp / 3600.0, 24.0);
-            const double lst = rev(sunMeanLon + 180.0 + utHours * 15.0 + obsLon);
-            const double hourAngle = rev(lst - ra);
-
-            double altitude = std::asin(sind(obsLat) * sind(dec) +
-                                        cosd(obsLat) * cosd(dec) * cosd(hourAngle)) * RAD;
-
-            // The moon is near enough that where you stand on the Earth moves
-            // it: about a degree of parallax, which is several minutes either
-            // side of moonrise.
-            altitude -= std::asin(1.0 / moonR) * RAD * cosd(altitude);
+            // Position and phase come from the astronomy interval; this lambda
+            // only draws. NAN means the clock has no time yet.
+            const float altitude = id(global_moon_altitude);
+            const float illuminated = id(global_moon_illuminated);
 
             // Below the horizon there is no moon to show. Altitude of the
             // centre, so this is a few minutes off the almanac's definition,
             // which uses the upper limb and allows for refraction.
-            if (altitude <= 0.0) {
+            if (std::isnan(altitude) || altitude <= 0.0f) {
               for (int j = 0; j < it.size(); j++) {
                 it[j] = Color(0, 0, 0);
               }
@@ -1708,8 +1920,10 @@ light:
             // The lit limb faces the sun: right while waxing seen from the
             // northern hemisphere, and mirrored south of the equator. At full
             // moon the arc closes and the centre stops mattering.
-            const bool northern = obsLat >= 0.0;
-            const int centre = (waxing == northern) ? (it.size() / 4) : (3 * it.size() / 4);
+            const bool northern = id(latitude_text_id).state.empty() ||
+                                  strtof(id(latitude_text_id).state.c_str(), nullptr) >= 0.0f;
+            const int centre = (id(global_moon_waxing) == northern) ? (it.size() / 4)
+                                                                    : (3 * it.size() / 4);
 
             for (int j = 0; j < it.size(); j++) {
               // distance from the centre of the arc, the short way round
@@ -1719,10 +1933,9 @@ light:
               }
 
               // The arc covers lit pixels in total, so lit/2 either side. The
-              // +1 closes the ring at full moon - without it the single pixel
-              // opposite the centre stays dark and leaves a visible gap. The
-              // fractional result dims the boundary pixel, which is what keeps
-              // a crescent from stepping a whole pixel at a time.
+              // +1 closes the ring at full moon; the fractional result dims the
+              // boundary pixel so a crescent does not step a whole pixel at a
+              // time.
               float level = 0.0f;
               if (lit >= 1.0f) {
                 level = std::min(std::max(lit / 2.0f - (float) dist + 1.0f, 0.0f), 1.0f);
@@ -1730,6 +1943,15 @@ light:
 
               const uint8_t v = (uint8_t) (${MOON_BRIGHTNESS} * level);
               it[j] = Color(v, v, v);
+            }
+
+            // Ambient dimming, see global_ambient_dim.
+            const float dim = id(global_ambient_dim);
+            if (dim < 0.999f) {
+              for (int k = 0; k < it.size(); k++) {
+                const Color c = it[k].get();
+                it[k] = Color(c.r * dim, c.g * dim, c.b * dim);
+              }
             }
       - addressable_rainbow:
       - addressable_color_wipe:

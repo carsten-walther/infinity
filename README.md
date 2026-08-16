@@ -103,6 +103,7 @@ All tunables live in `substitutions:` at the top of `infinity.yaml`:
 | `SUN_WHITE_ELEVATION` | solar elevation at which `Sun` reads as plain daylight |
 | `FIRE_COOLING` / `FIRE_SPARKING` | how short and how active the `Fire` flames are |
 | `FIRE_MAX_HEAT` | caps the fire palette short of white — raise towards `255` for white tips |
+| `ALARM_RED` / `ALARM_GREEN` / `ALARM_BLUE` | peak colour of the `Alarm` pulse |
 | `MIDDAY_DARKEN` | how far the `Darken to midday` face dims the arc behind the trailing hand |
 | `PIN_LED_RING` / `PIN_BRIGHTNESS` | see the pin table above before changing |
 
@@ -185,7 +186,9 @@ default clock, higher receive current — and no working die sensor to measure i
 | `Indicator` | Select | `Off`, `Show midday`, `Show quadrants`, `Show hour marks` |
 | `Enable seconds` | Switch | shows the second hand |
 | `Color hour` / `Color minute` / `Color second` | Text | hex colour, e.g. `#FF0000` |
-| `Latitude` / `Longitude` | Text | decimal degrees, north and east positive — drives the `Sun` effect |
+| `Latitude` / `Longitude` | Text | decimal degrees, north and east positive — drives the `Sun` and `Moon` effects |
+| `Alarm Time` | Datetime | daily alarm, switches the ring to the `Alarm` effect |
+| `Alarm Enabled` | Switch | arms `Alarm Time` without losing the setting |
 
 `Effect` is a convenience wrapper — the `LED color` light entity already carries the
 effect list natively in its more-info dialog. The select exists so the effect can sit
@@ -208,8 +211,15 @@ string. The light's `on_state` handler translates between ESPHome's `None` and t
 select's `Off` so the two stay in step.
 
 **Diagnostics** — ESPHome Version, Firmware Version, Device Uptime, Uptime,
-Reset Reason, Reset Count, Internal Temperature, SSID, IP Address, DNS Address,
-Connection Status, WiFi Signal (dBm), WiFi Signal (%), Brightness sensor.
+Reset Reason, Reset Count, Internal Temperature, Sun Elevation, Moon Altitude,
+Moon Illumination, Moon Phase, SSID, IP Address, DNS Address, Connection Status,
+WiFi Signal (dBm), WiFi Signal (%), Brightness sensor.
+
+`Sun Elevation`, `Moon Altitude`, `Moon Illumination` and `Moon Phase` come free: the
+`Sun` and `Moon` effects need those numbers anyway, so exposing them turns the clock
+into a usable source for automations without adding an integration for it. They are
+pushed by the interval that computes them rather than polled, so they can never report
+something the ring is not showing.
 
 `Internal Temperature` is the SoC die sensor, not the enclosure. The C3's absolute
 maximum is 125 °C and anything up to ~60 °C under load is unremarkable for a QFN part
@@ -357,3 +367,42 @@ face.
 ## License
 
 [GNU General Public License v3.0](LICENSE)
+
+## Architecture
+
+Two pieces of shared state are computed once and read everywhere, rather than
+recalculated per effect:
+
+- **`interval: 10s`** computes solar and lunar position into globals. Both the `Sun`
+  and `Moon` effects need the sun — `Moon` for the elongation that gives the phase and
+  for sidereal time — and the four sky diagnostics need both. Three copies of the same
+  trigonometry would be three chances to fix a bug in only two of them. The effect
+  lambdas read globals and draw; no double-precision astronomy sits on a render path.
+- **`global_ambient_dim`** holds the volts-to-brightness mapping, computed on the
+  `Brightness sensor`. `Time`, `Fire`, `Sun` and `Moon` each scale their finished frame
+  by it. `Alarm` deliberately does not — an alarm that turns itself down in a dark room
+  fails at the one moment it is needed.
+
+The two solar algorithms were cross-checked before being merged: the Astronomical
+Almanac's low-precision formula and Schlyter's orbital elements agree to 0.003° over a
+full year, so one set of elements now serves both bodies.
+
+### Boot and network
+
+`on_boot` lights `Twinkle`, and nothing switches to the clock face until WiFi
+`on_connect` fires — so the busy indicator is real. It used to be a boot trigger at
+priority 200 testing `wifi.connected`, which could never be true: every `on_boot`
+trigger runs inside `setup()`, milliseconds apart, long before the radio associates.
+
+There is deliberately no `on_disconnect` counterpart, and `on_connect` only acts if the
+ring is still on `Twinkle`. The clock runs off the system clock, not off the network,
+so losing WiFi is no reason to stop showing the time — and a reconnect should not undo
+whatever was selected in Home Assistant.
+
+The system clock takes two sources: SNTP, and Home Assistant. Whichever sets it first
+makes every time component valid, which covers the case where the internet is down but
+the LAN is fine.
+
+An OTA update parks the light for its duration — the effect lambdas and RMT transfers
+otherwise compete with the transfer for CPU and for the WiFi stack, which matters more
+now that the radio sleeps between beacons.
