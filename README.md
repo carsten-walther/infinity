@@ -16,8 +16,12 @@ The whole device — configuration and all C++ animations — lives in a single 
 | LED ring | 60× WS2811, GRB, on `GPIO10`, driven via RMT (`esp32_rmt_led_strip`) |
 | Brightness sensor | LDR divider on `GPIO01` (ADC1, 12 dB attenuation) |
 
-The ring needs its own 5 V supply — 60 LEDs at full white draw considerably more than
-the board's USB port can deliver.
+**The ring needs its own 5 V supply.** 60 LEDs at full white draw around 3.6 A, and
+even the normal clock face at 70 % brightness lights all 60 pixels for something in
+the region of 1–2 A. Feeding that through the DevKit's `5V` pin routes the whole
+current across the USB connector, the board traces and the ground return — far beyond
+what a devkit is built for, and the usual reason one of these boards "runs hot". Power
+the ring directly from the supply and join only the grounds.
 
 60 LEDs is not a decorative choice: one pixel per minute means a pixel index *is* the
 minute (and second) value, and the hour hand lands on `hour * 5`. All of the effect
@@ -88,17 +92,38 @@ All tunables live in `substitutions:` at the top of `infinity.yaml`:
 | `DAWN_DURATION_S` | length of the `Dawn` ramp |
 | `PIN_LED_RING` / `PIN_BRIGHTNESS` | see the pin table above before changing |
 
-`AMBIENT_DARK` and `AMBIENT_BRIGHT` ship as rough starting values; the resistor paired
-with the LDR decides the real range. They are in **volts**, which is what the
-`Brightness sensor` entity publishes — so a multimeter on the divider tap gives you
-the two numbers directly. Read them once in the dark and once in the sun and put them
-in. **If the clock dims the wrong way round, swap the two values** — the mapping is
-linear and handles a negative span on its own, so no code change is needed.
+`AMBIENT_DARK` and `AMBIENT_BRIGHT` are in **volts**, matching what the
+`Brightness sensor` entity publishes. Measured on the built device:
+
+| Condition | Reading |
+| --- | --- |
+| LDR covered | 0.09 V |
+| normal room light | 0.93 V |
+| torch on the sensor | 2.96 V |
+
+The shipped values (`0.10` / `1.20`) are deliberately **not** those extremes. An LDR
+divider is heavily non-linear and most of its swing sits above anything a living room
+reaches — mapping the full 0.09–2.96 V span would leave the clock at ~40 % brightness
+in a normally lit room. With the indoor window instead, a dark room gives the
+`MIN_FACE_BRIGHTNESS` floor of 15 %, normal room light ~79 %, and anything from
+1.20 V up clamps to full. Widen `AMBIENT_BRIGHT` if the clock stays too bright in the
+evening.
+
+**If the clock dims the wrong way round, swap the two values** — the mapping is linear
+and handles a negative span on its own, so no code change is needed. The measured
+polarity on this build is dark = low, bright = high, so no swap is needed.
 
 The ADC runs at `attenuation: 12db` (≈ 0–3.1 V) rather than the ESPHome default of
 `0db`, which caps at ≈ 1.1 V. With the default, every reading from a half-lit room
 upwards clipped to the same flat maximum — precisely the end of the scale the dimming
 has to resolve.
+
+It is also sampled once a second over 8 hardware reads and published every fifth, so
+the value is a 20-second moving average at the same 0.2 Hz as a plain reading. The
+`Time` effect reads the sensor's state, so the face only changes brightness when the
+sensor publishes — a single raw sample every 5 s made that step visibly, from ADC
+noise as much as from a passing cloud. The trade-off is latency: switching a lamp on
+takes about 20 s to fully register.
 
 ## Networking
 
@@ -118,14 +143,33 @@ The node is deliberately configured to keep running on its own:
 
 | Entity | Type | Values |
 | --- | --- | --- |
+| `Effect` | Select | any effect from the table below, or `None` |
 | `Face type` | Select | `Normal`, `Darken to midday` |
 | `Indicator` | Select | `None`, `Show midday`, `Show quadrants`, `Show hour marks` |
 | `Enable seconds` | Switch | shows the second hand |
 | `Color hour` / `Color minute` / `Color second` | Text | hex colour, e.g. `#FF0000` |
 
-**Diagnostics** — ESPHome Version, Firmware Version, Device Uptime, Uptime, SSID,
-IP Address, DNS Address, Connection Status, WiFi Signal (dBm), WiFi Signal (%),
-Brightness sensor.
+`Effect` is a convenience wrapper — the `LED color` light entity already carries the
+effect list natively in its more-info dialog. The select exists so the effect can sit
+on a dashboard as its own control and be set from an automation without a
+`light.turn_on` service call. It syncs both ways: changing the effect on the light
+updates the select.
+
+**Diagnostics** — ESPHome Version, Firmware Version, Device Uptime, Uptime,
+Reset Reason, Reset Count, Internal Temperature, SSID, IP Address, DNS Address,
+Connection Status, WiFi Signal (dBm), WiFi Signal (%), Brightness sensor.
+
+`Internal Temperature` is the SoC die sensor, not the enclosure. The C3's absolute
+maximum is 125 °C and anything up to ~60 °C under load is unremarkable for a QFN part
+with no heatsink. If the device runs hot, switch the light off and watch this for ten
+minutes: a clear drop means the heat comes from the LED supply path, not the ESP32 —
+see below.
+
+`Reset Reason` and `Reset Count` belong together: the reason comes straight from
+`esp_reset_reason()` and tells you *why* the device last restarted, the count tells
+you *that* it restarted while nobody was watching. Read both against `Device Uptime` —
+a rising count at a low uptime is a device rebooting in a loop. The count survives
+restarts and is only cleared by a factory reset.
 
 **Buttons** — Restart, Restart (Safe Mode), Factory Reset.
 

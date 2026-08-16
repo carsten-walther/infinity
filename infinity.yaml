@@ -50,21 +50,30 @@ substitutions:
   #
   # Ambient light calibration
   #
-  # The voltage the LDR divider on ${PIN_BRIGHTNESS} produces in a dark room
-  # and in full daylight. The Time effect maps anything in between onto a
-  # linear dim factor, so these are the only two numbers to touch when
-  # calibrating. Volts, matching what the Brightness sensor publishes - so a
-  # multimeter on the divider tap gives you these directly.
+  # The voltage the LDR divider on ${PIN_BRIGHTNESS} produces at the two ends
+  # of the range the face should react to. The Time effect maps anything in
+  # between onto a linear dim factor and clamps outside it. Volts, matching
+  # what the Brightness sensor publishes.
   #
-  # These are a starting point, not a measurement: the resistor paired with the
-  # LDR decides the real range. Read the sensor once in the dark and once in
-  # the sun and put those values here.
+  # Measured on the built device (2026-08-16):
+  #   LDR covered          0.09 V
+  #   normal room light    0.93 V
+  #   torch on the sensor  2.96 V
+  #
+  # Note these are NOT the measured extremes. The full span 0.09 - 2.96 V would
+  # put every indoor level in the bottom third of the scale, and the clock
+  # would sit at ~40% brightness in a normally lit room. An LDR divider is
+  # heavily non-linear and most of its swing sits above anything a living room
+  # ever reaches, so the useful window is the indoor band: 1.20 V is treated as
+  # "bright enough for full brightness" and anything above it clamps there.
+  # Widen AMBIENT_BRIGHT if the clock stays too bright in the evening.
   #
   # If the clock dims the wrong way round, the photoresistor sits on the other
-  # leg of the divider: SWAP these two values, no code change needed.
+  # leg of the divider: SWAP these two values, no code change needed. Measured
+  # polarity here is dark = low, bright = high, so no swap is needed.
   #
-  AMBIENT_DARK: "0.2"
-  AMBIENT_BRIGHT: "2.8"
+  AMBIENT_DARK: "0.10"
+  AMBIENT_BRIGHT: "1.20"
 
   #
   # How far the face is allowed to dim at night, as a fraction of the light's
@@ -121,6 +130,16 @@ esphome:
     # of these need: the light has to exist before an effect can be selected,
     # and component.update() on a not-yet-set-up entity is not something to rely
     # on.
+    # Deliberately NOT -100: a restoring global is a component of its own with
+    # setup_priority::HARDWARE, and incrementing at the same priority would be a
+    # race against the load() that reads the stored value - the increment could
+    # land on the initial 0 and then be overwritten by the restore, so the count
+    # would never grow. 700 is safely after every HARDWARE component.
+    - priority: 700
+      then:
+        - lambda: |-
+            id(reset_count_id) += 1;
+
     - priority: -100
       then:
         - light.turn_on:
@@ -130,8 +149,11 @@ esphome:
             green: 100%
             blue: 100%
             effect: Time
-        # publishes the compile-time version string once, see firmware_version_id
+        # Both are pushed rather than polled: the version string is a compile-time
+        # constant and the reset count changes once per boot, so an interval could
+        # only republish an unchanged value - publish_state does not deduplicate.
         - component.update: firmware_version_id
+        - component.update: reset_count_sensor_id
 
   # priority 700 runs early enough that the light is still controllable
   on_shutdown:
@@ -168,6 +190,7 @@ wifi:
   fast_connect: True
   power_save_mode: NONE
   enable_on_boot: True
+  output_power: 12dB
   ap:
     ssid: "${project_name}"
     password: !secret wifi_ap_password
@@ -247,6 +270,15 @@ logger:
   level: ERROR
 
 #
+# Provides the reset_reason text sensor further down. Nothing else from this
+# component is enabled - the heap and loop-time sensors it can expose poll
+# continuously, and this device has no memory problem to watch.
+#
+# https://esphome.io/components/debug
+#
+debug:
+
+#
 # https://esphome.io/components/globals
 #
 globals:
@@ -271,10 +303,37 @@ globals:
     restore_value: no
     initial_value: '0'
 
+  #
+  # Survives restarts, so a rising count is proof the device rebooted even if
+  # nobody was watching the log. Counts every restart alike - OTA, the Restart
+  # button, a power cut and a watchdog are indistinguishable here, which is why
+  # Reset Reason sits next to it. A factory reset clears it back to 0.
+  #
+  - id: reset_count_id
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
 #
 # https://esphome.io/components/text_sensor
 #
 text_sensor:
+
+  #
+  # Reset Reason
+  # https://esphome.io/components/text_sensor/debug
+  #
+  # Cause of the last restart, straight from esp_reset_reason(). Read it
+  # together with Reset Count and Device Uptime: the reason alone cannot tell
+  # you that a restart happened while nobody was looking, and a rising count at
+  # a low uptime is the signature of a device rebooting in a loop.
+  #
+  - platform: debug
+    reset_reason:
+      id: reset_reason_id
+      name: Reset Reason
+      icon: mdi:restart-alert
+      entity_category: diagnostic
 
   #
   # ESPHome Version
@@ -424,6 +483,27 @@ sensor:
     device_class: ""
 
   #
+  # Internal Temperature
+  #
+  # The SoC's own die sensor, not the enclosure. Added to turn "the chip feels
+  # hot" into a number that can be compared before and after a change - the
+  # C3's absolute maximum is 125 C, and anything up to ~60 C under load is
+  # unremarkable for a QFN part with no heatsink.
+  #
+  # Read it against what the ring is doing: switch the light off from Home
+  # Assistant and watch for ten minutes. If the temperature barely moves, the
+  # heat is not coming from the ESP32 at all but from the LED supply path.
+  #
+  # https://esphome.io/components/sensor/internal_temperature
+  #
+  - platform: internal_temperature
+    id: internal_temperature_id
+    name: Internal Temperature
+    icon: mdi:thermometer
+    entity_category: diagnostic
+    update_interval: 60s
+
+  #
   # https://esphome.io/components/sensor/wifi_signal
   #
   - platform: wifi_signal
@@ -475,8 +555,40 @@ sensor:
     icon: mdi:brightness-6
     pin: ${PIN_BRIGHTNESS}
     attenuation: 12db
-    update_interval: 5s
     accuracy_decimals: 3
+    # Sampled once a second and averaged over 8 hardware reads, but only
+    # published every fifth - so the traffic is the same 0.2 Hz as before while
+    # the value behind it is a 20-second moving average.
+    #
+    # This is what makes dusk look like dusk. The Time effect reads .state, so
+    # the face only changes brightness when this publishes: a single raw sample
+    # every 5s made it step visibly, both from ADC noise and from a cloud
+    # passing. Averaging shrinks each step to roughly a fifth. The cost is
+    # latency - switching a lamp on takes ~20s to fully register, which for a
+    # clock is a feature.
+    update_interval: 1s
+    samples: 8
+    filters:
+      - sliding_window_moving_average:
+          window_size: 20
+          send_every: 5
+
+  #
+  # Reset Count
+  #
+  # Pushed once from the late on_boot block, see reset_count_id for why the
+  # increment cannot happen there too.
+  #
+  - platform: template
+    id: reset_count_sensor_id
+    name: Reset Count
+    icon: mdi:restart-alert
+    state_class: total_increasing
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+    lambda: |-
+      return id(reset_count_id);
 
 #
 # https://esphome.io/components/switch/template
@@ -592,6 +704,44 @@ select:
     initial_option: "None"
     optimistic: true
     restore_value: true
+
+  #
+  # Effect
+  #
+  # The light entity already carries the effect list natively - Home Assistant
+  # shows it in the more-info dialog of "LED color". This select is a
+  # convenience wrapper so the effect can sit on a dashboard as its own control
+  # and be addressed from an automation without a light.turn_on service call.
+  #
+  # The option names must match the effect names below EXACTLY, "None"
+  # included: set_action passes the string straight to light.turn_on. There is
+  # no restore_value - the light restores its own effect, and the on_state
+  # handler on the light syncs this select to whatever it came back as.
+  #
+  - platform: template
+    name: Effect
+    icon: mdi:auto-fix
+    id: effect_select_id
+    options:
+      - "None"
+      - "Time"
+      - "Fire"
+      - "Alarm"
+      - "Dawn"
+      - "Moon"
+      - "Rainbow"
+      - "Color Wipe"
+      - "Scan"
+      - "Twinkle"
+      - "Random Twinkle"
+      - "Fireworks"
+      - "Addressable Flicker"
+    initial_option: "Time"
+    optimistic: true
+    set_action:
+      - light.turn_on:
+          id: led_ring_id
+          effect: !lambda return x;
 
 #
 # The clock face itself. Every animation below is an addressable_lambda rather
@@ -1107,6 +1257,22 @@ light:
       - addressable_random_twinkle:
       - addressable_fireworks:
       - addressable_flicker:
+
+    # Keeps the Effect select in step when the effect is changed anywhere else -
+    # from the light entity itself, from on_boot, or from on_turn_on below.
+    #
+    # publish_state, NOT make_call: a call would run the select's set_action,
+    # which calls light.turn_on, which fires on_state again. publish_state only
+    # updates the reported value, so the loop cannot start. The equality check
+    # additionally keeps this from republishing on every unrelated light state
+    # change - brightness, colour, on/off all land here too.
+    on_state:
+      - lambda: |-
+          const std::string effect = id(led_ring_id).get_effect_name().str();
+          if (id(effect_select_id).current_option().str() != effect &&
+              id(effect_select_id).has_option(effect)) {
+            id(effect_select_id).publish_state(effect);
+          }
 
     # Switching the light on always lands on the clock face at a known
     # brightness, whatever effect or colour was last set from Home Assistant.
