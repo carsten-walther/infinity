@@ -396,15 +396,21 @@ web_server:
 #
 # https://esphome.io/components/time
 #
-# Two sources, one system clock: whichever sets it first makes every time
-# component valid, so the effects keep reading id(sntp_time) either way. SNTP
-# needs a route to the internet; the Home Assistant import only needs Home
-# Assistant, which covers the case where the uplink is down but the LAN is fine.
+# SNTP only, deliberately.
+#
+# A "time: platform: homeassistant" fallback was tried here and removed again:
+# the API carries the time as uint32 epoch SECONDS, so every sync discarded the
+# sub-second alignment SNTP had established and stepped the system clock by up
+# to a second - backwards, most of the time, because truncation always rounds
+# down. It re-synced every 15 minutes, and on a device whose whole job is
+# showing seconds that was a visible jump four times an hour.
+#
+# The fallback it bought was real: time without a route to the internet. But a
+# clock that is occasionally wrong by a second in a way you can watch is worse
+# than a clock that needs NTP. If this comes back, it belongs with the second
+# hand switched off.
 #
 time:
-  - platform: homeassistant
-    id: ha_time
-
   - platform: sntp
     id: sntp_time
     timezone: Europe/Berlin
@@ -1419,11 +1425,17 @@ light:
       #
       - addressable_lambda:
           name: Time
-          # The smallest thing shown is a second, so anything faster is wasted
-          # work. Left at the 0ms default this lambda re-rendered 60 pixels on
-          # every main-loop pass - thousands of times a second for a display
-          # that changes once a second.
-          update_interval: 500ms
+          # 100ms, not the 500ms this used to be. The reasoning behind 500 was
+          # "the smallest thing shown is a second, so anything faster is wasted"
+          # - true of the CONTENT, wrong for the LATENCY. The display only moves
+          # on the first frame after a second boundary, so the render period is
+          # exactly how late the second hand can be, and half a second of that
+          # is plainly visible as an uneven step.
+          #
+          # Still nowhere near the 0ms default, which re-rendered 60 pixels on
+          # every main-loop pass. At 10 Hz this lambda costs well under a
+          # percent of a core.
+          update_interval: 100ms
           lambda: |-
             // face types
             constexpr int FACETYPE_NORMAL = 0;

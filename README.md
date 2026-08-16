@@ -251,9 +251,13 @@ Plus the ESPHome built-ins: Rainbow, Color Wipe, Scan, Twinkle, Random Twinkle,
 Fireworks and Flicker.
 
 Each effect declares its own `update_interval`, matched to how fast it can actually
-change — 500 ms for `Time`, 30 ms for `Fire` and `Alarm`, 10 s for `Sun` and `Moon`.
+change — 100 ms for `Time`, 30 ms for `Fire` and `Alarm`, 10 s for `Sun` and `Moon`.
 Left at the ESPHome default of `0ms` a lambda re-renders all 60 pixels on every
 main-loop pass.
+
+`Time` runs at 100 ms rather than the 500 ms it once had. The render period is exactly
+how late the second hand can be — the display only moves on the first frame after a
+second boundary — and half a second of that is visible as an uneven step.
 
 `Sun` simulates the sun in real time. It computes the solar elevation for the
 device's own coordinates and shows it directly: dark below the horizon, one pixel at
@@ -416,9 +420,13 @@ ring is still on `Twinkle`. The clock runs off the system clock, not off the net
 so losing WiFi is no reason to stop showing the time — and a reconnect should not undo
 whatever was selected in Home Assistant.
 
-The system clock takes two sources: SNTP, and Home Assistant. Whichever sets it first
-makes every time component valid, which covers the case where the internet is down but
-the LAN is fine.
+The system clock comes from SNTP only. A `time: platform: homeassistant` fallback was
+tried and removed: the API carries time as a uint32 epoch in **seconds**, so every
+15-minute sync discarded the sub-second alignment SNTP had established and stepped the
+clock by up to a second — backwards, usually, since truncation always rounds down. On a
+device whose job is showing seconds that was a visible jump four times an hour. The
+fallback it bought was real — time without a route to the internet — but not at that
+price. If it comes back, it belongs with the second hand switched off.
 
 An OTA update parks the light for its duration — the effect lambdas and RMT transfers
 otherwise compete with the transfer for CPU and for the WiFi stack, which matters more
