@@ -138,6 +138,28 @@ The node is deliberately configured to keep running on its own:
 - **Web server** (version 3, assets served locally) on port 80.
 - **Time** via SNTP against `pool.ntp.org`, timezone `Europe/Berlin`.
 
+### Power and heat
+
+The die ran at 67 °C with `power_save_mode: NONE` and the CPU at its default 160 MHz —
+warm, though well inside the C3's 125 °C limit. With the LED ring on its own supply,
+none of that came from the strip, so two settings address it:
+
+- `power_save_mode: LIGHT` (`WIFI_PS_MIN_MODEM`) — sleeps between DTIM beacons instead
+  of keeping the radio powered permanently. Only **inbound** traffic is delayed, by up
+  to one beacon interval (typically 100–300 ms); outbound publishes and the clock
+  itself are unaffected. If OTA updates start failing, this is the first thing to put
+  back to `NONE`.
+- `cpu_frequency: 80MHZ` — half the default. Nothing here is compute-bound; raise it
+  back to `160MHZ` if an effect ever stutters.
+
+`output_power: 12dB` is a reduction from the ~20 dBm default, but it barely matters —
+this node transmits well under 0.1 % of the time. Do not go lower: at the measured
+RSSI of −63 to −65 dBm a weaker uplink causes retransmits, which cost more airtime
+than the lower power saves.
+
+Note the ESP32-WROOM-32 would run *hotter*, not cooler: two Xtensa cores, a 240 MHz
+default clock, higher receive current — and no working die sensor to measure it with.
+
 ## Entities
 
 **Light** — `LED color`: the whole ring, dimmable and colourable, carrying all effects.

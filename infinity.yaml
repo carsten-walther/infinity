@@ -60,8 +60,8 @@ substitutions:
   # if the bare ring is ever used as a lamp.
   #
   IDLE_RED: "100%"
-  IDLE_GREEN: "100%"
-  IDLE_BLUE: "100%"
+  IDLE_GREEN: "60%"
+  IDLE_BLUE: "20%"
 
   #
   # Ambient light calibration
@@ -206,6 +206,15 @@ esphome:
 #
 esp32:
   board: esp32-c3-devkitm-1
+
+  # Half the 160 MHz this variant defaults to. Dynamic power scales with clock,
+  # so this is the second lever against the die temperature after the WiFi power
+  # save mode - smaller than that one, and unlike it, free: nothing here is
+  # compute-bound. The heaviest load is the Fire effect at 30 ms over 30 heat
+  # cells, and Time at 500 ms over 60 pixels; an ESP8266 does comparable work at
+  # this clock. Raise it back to 160MHZ if an effect ever starts stuttering.
+  cpu_frequency: 80MHZ
+
   framework:
     # esp-idf, not arduino: the only thing that tied this device to arduino was
     # the neopixelbus light platform, which wraps an Arduino library. The light
@@ -227,8 +236,31 @@ wifi:
   password: !secret wifi_password
   domain: .local
   fast_connect: True
-  power_save_mode: NONE
+
+  # LIGHT, not the NONE this started with: NONE keeps the radio powered up
+  # permanently, which was the single largest heat source on this board - the
+  # die sat at 67 C with the LED ring on its own supply, so none of that was
+  # coming from the strip. LIGHT maps to WIFI_PS_MIN_MODEM, which sleeps between
+  # DTIM beacons and wakes for every one of them.
+  #
+  # The trade is one-sided in this device's favour. Only INBOUND traffic is
+  # delayed - the access point buffers it until the next beacon, typically 100
+  # to 300 ms. Outbound is not affected at all, so the sensor publishes that
+  # make up almost all of this node's traffic go out immediately, and the clock
+  # itself never touches the network between SNTP syncs.
+  #
+  # HIGH would sleep through a longer listen interval. Not worth it: the delay
+  # reaches seconds and the link gets fragile at this RSSI (-63 to -65 dBm).
+  #
+  # If OTA updates start failing, this is the first line to put back to NONE.
+  power_save_mode: LIGHT
+
   enable_on_boot: True
+
+  # Reduced from the ~20 dBm default. Barely moves the power budget - this node
+  # transmits well under 0.1% of the time - but it does no harm either. Do not
+  # go lower: at this RSSI a weaker uplink means retransmits, and those cost
+  # more airtime than the lower power saves.
   output_power: 12dB
   ap:
     ssid: "${project_name}"
