@@ -90,6 +90,8 @@ All tunables live in `substitutions:` at the top of `infinity.yaml`:
 | `AMBIENT_DARK` / `AMBIENT_BRIGHT` | LDR divider voltage in a dark room and in full daylight |
 | `MIN_FACE_BRIGHTNESS` | how far the face may dim at night, as a fraction — never `0` |
 | `DAWN_DURATION_S` | length of the `Dawn` ramp |
+| `FIRE_COOLING` / `FIRE_SPARKING` | how short and how active the `Fire` flames are |
+| `FIRE_MAX_HEAT` | caps the fire palette short of white — raise towards `255` for white tips |
 | `PIN_LED_RING` / `PIN_BRIGHTNESS` | see the pin table above before changing |
 
 `AMBIENT_DARK` and `AMBIENT_BRIGHT` are in **volts**, matching what the

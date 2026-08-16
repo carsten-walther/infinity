@@ -89,6 +89,29 @@ substitutions:
   #
   DAWN_DURATION_S: "900"
 
+  #
+  # Fire effect
+  #
+  # COOLING: how fast a flame cools down each frame. Higher means shorter,
+  # darker flames. The original carried a comment recommending 20-100 and then
+  # set 15, which is far too little: sparks arrive faster than the heat drains,
+  # every cell pins at the top of the scale, and the top of the palette is
+  # white. That only became visible once the heat buffer was made to persist
+  # between frames - before that it was re-created as uninitialised stack
+  # memory every frame and nothing could accumulate.
+  #
+  # SPARKING: chance out of 255 that a new spark ignites at the base on any
+  # given frame. Higher is a more active fire. Sensible range 50-200.
+  #
+  # MAX_HEAT: caps the palette lookup. The heat-to-colour ramp runs
+  # black -> red -> orange -> yellow -> white, and the white only starts above
+  # ~170. Clamping there keeps even the hottest cells yellow. Raise it towards
+  # 255 to let the white tips back in.
+  #
+  FIRE_COOLING: "55"
+  FIRE_SPARKING: "120"
+  FIRE_MAX_HEAT: "170"
+
 #
 # https://esphome.io/components/esphome
 #
@@ -980,13 +1003,11 @@ light:
           # can refill it, which looks like noise rather than flames.
           update_interval: 30ms
           lambda: |-
-            // The first one (Cooling) indicates how fast a flame cools down.
-            // More cooling means shorter flames, and the recommended values are between 20 and 100.
-            constexpr int cooling = 15;
-
-            // The second parameter (Sparking) indicates the chance (out of 255) that a spark will ignite.
-            // A higher value makes the fire more active. Suggested values lay between 50 and 200.
-            constexpr int sparking = 120;
+            // All three are tunable at the top of this file, with the reasoning
+            // for the values on the substitutions themselves.
+            constexpr int cooling = ${FIRE_COOLING};
+            constexpr int sparking = ${FIRE_SPARKING};
+            constexpr uint8_t maxHeat = ${FIRE_MAX_HEAT};
 
             constexpr int MAX_PIXELS = 128;
 
@@ -1082,8 +1103,9 @@ light:
 
             // Step 4. Map from heat cells to LED colors
             for (int j = 0; j < numPixels; j++) {
-              // calculate color temperature
-              Color color = getHeatColor(heat[j]);
+              // calculate color temperature, clamped short of the white end of
+              // the palette - see FIRE_MAX_HEAT
+              Color color = getHeatColor(std::min(heat[j], maxHeat));
 
               // forward the frames
               it[j + numPixels] = color;
