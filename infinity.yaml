@@ -388,7 +388,15 @@ mqtt:
   username: !secret mqtt_username
   password: !secret mqtt_password
   reboot_timeout: 0s
-  enable_on_boot: True
+
+  # Off at boot, and the MQTT switch's restore_mode has to stay in step with this
+  # line. The coupling is not cosmetic: TemplateSwitch::setup() acts on the
+  # restored state rather than just publishing it - it calls turn_on() or
+  # turn_off() outright, firing the actions - so a mismatch here silently
+  # overrides this value a moment after boot, and the config validates happily
+  # while doing it. Change one, change the other.
+  enable_on_boot: False
+
   # No autodiscovery: the entities are declared in Home Assistant by hand, so
   # discovery would only publish retained config topics nobody consumes.
   discovery: False
@@ -1240,6 +1248,46 @@ datetime:
 # https://esphome.io/components/switch/template
 #
 switch:
+
+  #
+  # MQTT
+  #
+  # Brings the broker connection up or down without reflashing.
+  #
+  # Deliberately NOT mirroring the real state with a lambda: the only getter is
+  # is_connected(), so the switch would snap back to off whenever the broker is
+  # briefly unreachable and look broken. This reports what was asked for, not
+  # what the network is doing.
+  #
+  # Visible, unlike the same switch in dew-point-ventilation.yaml, where it is
+  # internal. The reasoning there is that switching mqtt off over mqtt removes
+  # the entity that would switch it back on - but this device publishes its
+  # entities over the native API, with mqtt discovery off entirely, so the
+  # switch survives its own use.
+  #
+  # Worth knowing: "esphome logs" finds this device by asking the broker on
+  # esphome/discover/${project_name}. With mqtt off - the default - it needs the
+  # IP or the mDNS name instead:
+  #
+  #   esphome logs ${project_name}.yaml --device ${project_name}.local
+  #
+  # ALWAYS_OFF rather than RESTORE_DEFAULT_OFF, deliberately: mqtt off is the
+  # intended state after every boot, not merely the initial one. Persisting an
+  # "on" across a restart would quietly undo that.
+  #
+  - platform: template
+    id: mqtt_state_id
+    name: MQTT
+    icon: mdi:transit-connection-variant
+    optimistic: True
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+    turn_on_action:
+      then:
+        - mqtt.enable:
+    turn_off_action:
+      then:
+        - mqtt.disable:
 
   #
   # Arms the Alarm Time trigger. Separate from the time itself so the alarm can

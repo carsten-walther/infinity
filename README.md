@@ -148,7 +148,7 @@ takes about 20 s to fully register.
 The node is deliberately configured to keep running on its own:
 
 - **API** with encryption and `reboot_timeout: 0s` — no reboot when Home Assistant is unreachable.
-- **MQTT** with `reboot_timeout: 0s` and `discovery: False`; entities have to be added to Home Assistant by hand.
+- **MQTT** is **off at boot**, with `reboot_timeout: 0s` and `discovery: False`. Everything the device does works without a broker — the clock runs from SNTP and Home Assistant reaches it over the native API — so it comes up in the cheapest state and MQTT is switched on when wanted, from the `MQTT` switch.
 - **WiFi** with `fast_connect`, light power saving (see below), plus a fallback access point and captive portal.
 - **Web server** (version 3, assets served locally) on port 80.
 - **Time** via SNTP against `pool.ntp.org`, timezone `Europe/Berlin`.
@@ -192,6 +192,7 @@ default clock, higher receive current — and no working die sensor to measure i
 | `Alarm Time` | Datetime | daily alarm, switches the ring to the `Alarm` effect |
 | `Alarm Enabled` | Switch | arms `Alarm Time` without losing the setting |
 | `Alarm Duration` | Number | minutes the alarm pulses before standing down, 1–60 |
+| `MQTT` | Switch | brings the broker connection up or down — off after every boot |
 
 The alarm switches the ring on, selects the `Alarm` effect, and stands down by itself
 after `Alarm Duration` minutes. There is deliberately no snooze.
@@ -452,6 +453,27 @@ There is deliberately no `on_disconnect` counterpart, and `on_connect` only acts
 ring is still on `Twinkle`. The clock runs off the system clock, not off the network,
 so losing WiFi is no reason to stop showing the time — and a reconnect should not undo
 whatever was selected in Home Assistant.
+
+The `MQTT` switch reports what was *asked for*, not what the network is doing — the
+only getter available is `is_connected()`, so mirroring the real state would make the
+switch snap back to off whenever the broker was briefly unreachable and look broken.
+
+Its `restore_mode` has to stay in step with `enable_on_boot` in the `mqtt:` block. The
+coupling is not cosmetic: `TemplateSwitch::setup()` acts on the restored state rather
+than just publishing it — it calls `turn_on()` or `turn_off()` outright, firing the
+actions — so a mismatch silently overrides `enable_on_boot` a moment after boot, and
+the config validates happily while doing it. Both currently say off.
+
+`ALWAYS_OFF` rather than `RESTORE_DEFAULT_OFF`, deliberately: MQTT off is the intended
+state after *every* boot, not merely the first one. Persisting an "on" across a restart
+would quietly undo that.
+
+**`esphome logs` cannot find the device over MQTT while it is off** — that discovery
+asks the broker on `esphome/discover/infinity`. Use the address instead:
+
+```sh
+esphome logs infinity.yaml --device infinity.local
+```
 
 The system clock comes from SNTP only. A `time: platform: homeassistant` fallback was
 tried and removed: the API carries time as a uint32 epoch in **seconds**, so every
