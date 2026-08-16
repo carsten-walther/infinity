@@ -17,7 +17,17 @@ substitutions:
   #
   # GPIOs
   #
-  PIN_LED_RING: GPIO02
+  # GPIO10 is one of the few pins on this board with no second job: no
+  # strapping function, no ADC channel, no flash, no USB, no UART. GPIO02 - the
+  # previous choice - is a strapping pin. It worked, because the pin is
+  # high-impedance at reset and a WS2811 data input does not pull it down, but
+  # a level shifter, a pulldown or a long noisy cable turns that into a device
+  # that boots into download mode now and then.
+  PIN_LED_RING: GPIO10
+
+  # ADC1 channel 1. Only GPIO00, GPIO01, GPIO03 and GPIO04 are usable analogue
+  # inputs here: everything else is either taken or on ADC2, which the C3
+  # cannot read while WiFi is up.
   PIN_BRIGHTNESS: GPIO01
 
   #
@@ -40,20 +50,21 @@ substitutions:
   #
   # Ambient light calibration
   #
-  # The two readings the Brightness sensor reports in a dark room and in full
-  # daylight, in the same unit that sensor publishes. The Time effect maps
-  # anything in between onto a linear dim factor, so these are the only two
-  # numbers to touch when calibrating.
+  # The voltage the LDR divider on ${PIN_BRIGHTNESS} produces in a dark room
+  # and in full daylight. The Time effect maps anything in between onto a
+  # linear dim factor, so these are the only two numbers to touch when
+  # calibrating. Volts, matching what the Brightness sensor publishes - so a
+  # multimeter on the divider tap gives you these directly.
   #
-  # These are a starting point, not a measurement - the divider on
-  # ${PIN_BRIGHTNESS} decides the real range. Read the sensor once in the dark
-  # and once in the sun and put those values here.
+  # These are a starting point, not a measurement: the resistor paired with the
+  # LDR decides the real range. Read the sensor once in the dark and once in
+  # the sun and put those values here.
   #
   # If the clock dims the wrong way round, the photoresistor sits on the other
   # leg of the divider: SWAP these two values, no code change needed.
   #
-  AMBIENT_DARK: "5.0"
-  AMBIENT_BRIGHT: "80.0"
+  AMBIENT_DARK: "0.2"
+  AMBIENT_BRIGHT: "2.8"
 
   #
   # How far the face is allowed to dim at night, as a fraction of the light's
@@ -443,10 +454,18 @@ sensor:
       - lambda: return std::min(std::max(2 * (x + 100.0), 0.0), 100.0);
 
   #
-  # Ambient brightness, intended to dim the clock face at night.
+  # Ambient brightness from an LDR divider. Read by the Time effect, which dims
+  # the whole face between AMBIENT_DARK and AMBIENT_BRIGHT.
   #
-  # ToDo: nothing consumes this yet - the Time effect carries the matching
-  # ToDo markers. Until then it is a plain measurement.
+  # Published as plain volts. It used to multiply by 100 and call the result
+  # "%", which it never was - that is volts times a hundred, and it made the
+  # calibration values impossible to check against a multimeter.
+  #
+  # attenuation is spelled out because the schema default is 0db, which caps
+  # the input at ~1.1 V. An LDR divider on 3.3 V spends most of its range above
+  # that, so every reading from a half-lit room upwards clipped to the same
+  # flat maximum - exactly the end of the scale the dimming needs to resolve.
+  # 12db opens the range to ~0 - 3.1 V.
   #
   # https://esphome.io/components/sensor/adc
   #
@@ -455,10 +474,9 @@ sensor:
     name: Brightness sensor
     icon: mdi:brightness-6
     pin: ${PIN_BRIGHTNESS}
+    attenuation: 12db
     update_interval: 5s
-    unit_of_measurement: '%'
-    filters:
-      - multiply: 100
+    accuracy_decimals: 3
 
 #
 # https://esphome.io/components/switch/template

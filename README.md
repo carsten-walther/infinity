@@ -13,8 +13,8 @@ The whole device — configuration and all C++ animations — lives in a single 
 | --- | --- |
 | Board | ESP32-C3 (`esp32-c3-devkitm-1`) |
 | Framework | ESP-IDF |
-| LED ring | 60× WS2811, GRB, on `GPIO02`, driven via RMT (`esp32_rmt_led_strip`) |
-| Brightness sensor | ADC on `GPIO01` |
+| LED ring | 60× WS2811, GRB, on `GPIO10`, driven via RMT (`esp32_rmt_led_strip`) |
+| Brightness sensor | LDR divider on `GPIO01` (ADC1, 12 dB attenuation) |
 
 The ring needs its own 5 V supply — 60 LEDs at full white draw considerably more than
 the board's USB port can deliver.
@@ -26,6 +26,27 @@ and indicator maths assumes that mapping.
 Note the framework: no Arduino-only APIs (`String`, `WiFi.*`, `byte`, the `min`/`max`
 macros) work in a lambda here. The effects use `std::min` / `std::max` / `std::abs`
 for that reason.
+
+### Choosing pins on the ESP32-C3
+
+Both pins are set as substitutions at the top of `infinity.yaml`. If you rewire, these
+are the constraints on this board:
+
+| GPIO | Usable for |
+| --- | --- |
+| `0`, `1`, `3`, `4` | analogue in (ADC1) or digital |
+| `5` | digital only — ADC2, which cannot be read while WiFi is up |
+| `6`, `7`, `10` | digital, no second function |
+| `2`, `8`, `9` | **strapping pins** — avoid; `8` also drives the on-board RGB LED, `9` is the BOOT button |
+| `11`–`17` | SPI flash, unavailable |
+| `18`, `19` | USB Serial/JTAG |
+| `20`, `21` | UART0 console |
+
+The LED ring sat on `GPIO02` originally. That boots, because the pin is
+high-impedance at reset and a WS2811 data input does not pull it down — but a level
+shifter, a pulldown or a long noisy cable turns it into a board that occasionally
+comes up in download mode. RMT reaches any pin through the GPIO matrix, so there is
+no reason to spend a strapping pin on it.
 
 ## Getting started
 
@@ -62,15 +83,22 @@ All tunables live in `substitutions:` at the top of `infinity.yaml`:
 | Substitution | Purpose |
 | --- | --- |
 | `DEFAULT_BRIGHTNESS` | brightness the clock returns to on boot and on switch-on |
-| `AMBIENT_DARK` / `AMBIENT_BRIGHT` | Brightness sensor readings in a dark room and in full daylight |
+| `AMBIENT_DARK` / `AMBIENT_BRIGHT` | LDR divider voltage in a dark room and in full daylight |
 | `MIN_FACE_BRIGHTNESS` | how far the face may dim at night, as a fraction — never `0` |
 | `DAWN_DURATION_S` | length of the `Dawn` ramp |
+| `PIN_LED_RING` / `PIN_BRIGHTNESS` | see the pin table above before changing |
 
-`AMBIENT_DARK` and `AMBIENT_BRIGHT` ship as rough starting values; the divider on
-`GPIO01` decides the real range. Read the `Brightness sensor` entity once in the dark
-and once in the sun and put those two numbers in. **If the clock dims the wrong way
-round, swap the two values** — the mapping is linear and handles a negative span on
-its own, so no code change is needed.
+`AMBIENT_DARK` and `AMBIENT_BRIGHT` ship as rough starting values; the resistor paired
+with the LDR decides the real range. They are in **volts**, which is what the
+`Brightness sensor` entity publishes — so a multimeter on the divider tap gives you
+the two numbers directly. Read them once in the dark and once in the sun and put them
+in. **If the clock dims the wrong way round, swap the two values** — the mapping is
+linear and handles a negative span on its own, so no code change is needed.
+
+The ADC runs at `attenuation: 12db` (≈ 0–3.1 V) rather than the ESPHome default of
+`0db`, which caps at ≈ 1.1 V. With the default, every reading from a half-lit room
+upwards clipped to the same flat maximum — precisely the end of the scale the dimming
+has to resolve.
 
 ## Networking
 
