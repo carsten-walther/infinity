@@ -24,8 +24,9 @@ what a devkit is built for, and the usual reason one of these boards "runs hot".
 the ring directly from the supply and join only the grounds.
 
 60 LEDs is not a decorative choice: one pixel per minute means a pixel index *is* the
-minute (and second) value, and the hour hand lands on `hour * 5`. All of the effect
-and indicator maths assumes that mapping.
+minute (and second) value, and the hour hand belongs at `(hour % 12) * 5` — plus
+`minute / 12`, so it creeps through the hour rather than jumping on it. All of the
+effect and indicator maths assumes that mapping.
 
 Note the framework: no Arduino-only APIs (`String`, `WiFi.*`, `byte`, the `min`/`max`
 macros) work in a lambda here. The effects use `std::min` / `std::max` / `std::abs`
@@ -101,6 +102,7 @@ All tunables live in `substitutions:` at the top of `infinity.yaml`:
 | `DAWN_DURATION_S` | length of the `Dawn` ramp |
 | `FIRE_COOLING` / `FIRE_SPARKING` | how short and how active the `Fire` flames are |
 | `FIRE_MAX_HEAT` | caps the fire palette short of white — raise towards `255` for white tips |
+| `MIDDAY_DARKEN` | how far the `Darken to midday` face dims the arc behind the trailing hand |
 | `PIN_LED_RING` / `PIN_BRIGHTNESS` | see the pin table above before changing |
 
 `AMBIENT_DARK` and `AMBIENT_BRIGHT` are in **volts**, matching what the
@@ -227,7 +229,7 @@ restarts and is only cleared by a factory reset.
 | --- | --- |
 | `Time` | the clock face: hour, minute and optional second hand as a gradient around the ring, in the colours set by the `Color …` entities, dimmed to ambient light |
 | `Fire` | fire simulation, mirrored across both halves of the ring |
-| `Moon` | current moon phase as a lit segment, from the synodic month against a fixed new-moon epoch |
+| `Moon` | the actual moon: the ring lights the illuminated fraction of the disc, so full moon closes the circle and new moon is dark |
 | `Dawn` | wake-up ramp: opens from midday outwards and warms from red through amber to daylight over `DAWN_DURATION_S`, then holds |
 | `Alarm` | red pulse, roughly two seconds per cycle |
 
@@ -242,6 +244,24 @@ main-loop pass.
 `Dawn` does not follow the real sunrise: that needs latitude and longitude via the
 `sun` component, which this device does not configure. It is a ramp on its own frame
 counter, restarted whenever the effect is selected.
+
+`Moon` does follow the real moon. The lit arc is the illuminated fraction of the disc,
+`(1 − cos(2π · cycles)) / 2`, so it grows slowly around new and full and quickly around
+the quarters — and it centres on the right while waxing, on the left while waning, the
+way the lit limb faces:
+
+| Phase | Ring |
+| --- | --- |
+| new | dark |
+| day 3 | 7 of 60 pixels, right of centre |
+| first quarter | 33 of 60 |
+| full | all 60 |
+| last quarter | 33 of 60, left of centre |
+
+The phase comes from the mean synodic month (29.530588853 days) against the standard
+epoch of 2000-01-06 18:14 UTC. Real lunar months vary between 29.27 and 29.83 days, so
+this can be up to about half a day out — fine for an LED ring, but it is not an
+ephemeris. `MOON_BRIGHTNESS` sets the peak level.
 
 `gamma_correct` is set to `1.0` rather than the ESPHome default of `2.8`. Gamma is
 right for a light dimmed by hand, but every effect here computes its own gradient —

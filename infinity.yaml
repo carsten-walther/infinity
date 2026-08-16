@@ -34,11 +34,23 @@ substitutions:
   # LED ring
   #
   # 60 is not a decorative choice: one pixel per minute means a pixel index IS
-  # the minute (and second) value, and the hour hand lands on hour * 5. Every
-  # effect below and all of the indicator maths assume that mapping, so changing
-  # this number alone does not produce a working clock.
+  # the minute (and second) value, and the hour hand belongs at (hour % 12) * 5.
+  # Every effect below and all of the indicator maths assume that mapping, so
+  # changing this number alone does not produce a working clock.
   #
   NUM_LEDS: "60"
+
+  #
+  # How far the "Darken to midday" face dims the arc behind the trailing hand,
+  # as a fraction of what is already there. 0.15 keeps a visible trace; 0 blanks
+  # it completely.
+  #
+  # This scales the colour rather than subtracting a fixed amount from each
+  # channel, which is what it used to do - subtracting 240 out of 255 left at
+  # most 15 per channel, so it erased the arc instead of darkening it, and it
+  # shifted the hue on the way because the channels hit zero at different points.
+  #
+  MIDDAY_DARKEN: "0.15"
 
   #
   # Brightness the clock comes back to on boot and on every switch-on. 60 LEDs
@@ -130,6 +142,14 @@ substitutions:
   FIRE_COOLING: "55"
   FIRE_SPARKING: "120"
   FIRE_MAX_HEAT: "170"
+
+  #
+  # Moon effect
+  #
+  # Peak brightness, 0-255, before the light's own brightness setting scales it.
+  # Moonlight is meant to be dim - the whole ring at 255 is a lamp, not a moon.
+  #
+  MOON_BRIGHTNESS: "64"
 
 #
 # https://esphome.io/components/esphome
@@ -901,11 +921,10 @@ light:
                            left.b + ((right.b - left.b) * progress));
             };
 
-            auto darken = [](Color color, uint8_t delta) -> Color {
-              color.r = (color.r > delta) ? color.r - delta : 0;
-              color.g = (color.g > delta) ? color.g - delta : 0;
-              color.b = (color.b > delta) ? color.b - delta : 0;
-              return color;
+            // Scales a colour towards black. Multiplicative on purpose - see
+            // MIDDAY_DARKEN for why subtracting a fixed delta was wrong.
+            auto darken = [](Color color, float factor) -> Color {
+              return Color(color.r * factor, color.g * factor, color.b * factor);
             };
 
             // set the LED to the inverse of the two LEDs next to it, showing as white on the main face
@@ -949,6 +968,22 @@ light:
               return;
             }
 
+            // Pixel positions on the ring. An index is a MINUTE, so the hour
+            // hand belongs at (hour % 12) * 5 - the extra minute/12 makes it
+            // creep forward through the hour instead of jumping on the hour,
+            // the way a real hour hand moves.
+            //
+            // This used to index the ring with time.hour directly. On a 60
+            // pixel dial that put the hour hand at "hour minutes past": pixel 9
+            // at 09:45 where it belongs at 48, pixel 23 at 23:00 where it
+            // belongs at 55. It was only ever right at midnight, and it never
+            // left the top half of the dial. Worse, firsthand/secondhand below
+            // then compared an 0-23 hour against an 0-59 minute - two different
+            // units - so which hand counted as "first", and with it the whole
+            // gradient, was decided by a meaningless comparison.
+            const int hour_pos = ((hour % 12) * 60 + minute) / 12;
+            const int minute_pos = minute;
+
             auto face_type = id(infinity_face_type).active_index();
             auto indicator = id(infinity_indicator).active_index();
             auto enable_seconds = id(global_enable_seconds);
@@ -961,8 +996,8 @@ light:
             Color c2blend;
 
             int gap;
-            int firsthand = std::min(hour, minute);
-            int secondhand = std::max(hour, minute);
+            int firsthand = std::min(hour_pos, minute_pos);
+            int secondhand = std::max(hour_pos, minute_pos);
 
             Color hour_color = parseColor(id(infinity_color_hour).state, Color(255, 0, 0));
             Color minute_color = parseColor(id(infinity_color_minute).state, Color(0, 255, 0));
@@ -975,7 +1010,7 @@ light:
             // red, but the colour is user-supplied now, so any hand colour with
             // two components would have rendered differently depending on
             // whether the hour or the minute hand came first.
-            if (hour > minute) {
+            if (hour_pos > minute_pos) {
               c2 = Color(hour_color.r, hour_color.g, hour_color.b);
               c1 = Color(minute_color.r, minute_color.g, minute_color.b);
             } else {
@@ -1002,8 +1037,8 @@ light:
               it[i % it.size()] = linearBlend(c1blend, c1, ((float) i - (float) secondhand) / (float) gap);
             }
 
-            it[hour] = hour_color;
-            it[minute] = minute_color;
+            it[hour_pos] = hour_color;
+            it[minute_pos] = minute_color;
 
             // face types
             switch (face_type.value()) {
@@ -1012,9 +1047,15 @@ light:
               case FACETYPE_NORMAL:
                 break;
               case FACETYPE_DARKEN_TO_MIDDAY: {
-                // darkens the pixels between the second hand and midday because Brian suggested it.
-                for (int i = std::max(hour, minute); i < it.size(); i++) {
-                  it[i] = darken(it[i].get(), 240);
+                // Darkens everything between the trailing hand and midday
+                // (pixel 0), so the eye is drawn to the arc the hands span.
+                //
+                // Starts at secondhand + 1, not at secondhand: that pixel IS
+                // the trailing hand, and including it darkened the hand away.
+                // At 15:07 the hour hand was the trailing one and simply
+                // vanished.
+                for (int i = secondhand + 1; i < it.size(); i++) {
+                  it[i] = darken(it[i].get(), ${MIDDAY_DARKEN}f);
                 }
                 break;
               }
@@ -1266,35 +1307,57 @@ light:
             // either never move or run the ramp in PROGRESS_END seconds flat
             const int i = (int) ((long) elapsed * PROGRESS_END / DURATION_S);
 
-            int bright;
-            int green;
-            int blue = 0;
+            // One ramp per channel. The originals were called green, bright and
+            // blue and none of the three named the channel it fed - the
+            // variable called "blue" drove green, "bright" drove blue. Renamed
+            // to what they actually are, because that mix-up is exactly what
+            // hid the bug fixed below.
+            int red_ramp;
+            int green_ramp;
+            int blue_ramp = 0;
 
+            // starts high and rises: the sky is red before it is anything else
+            red_ramp = std::max(142, i);
+
+            // comes in second, over three segments of increasing steepness
             if (i < 142) {
-              bright = i * 64 / 142;
+              green_ramp = i * 64 / 142;
             } else if (i >= 142 && i < 204) {
-              bright = 64 + (i - 142) * 128 / 62;
+              green_ramp = 64 + (i - 142) * 128 / 62;
             } else {
-              bright = 192 + (i - 204) * 64 / 51;
+              green_ramp = 192 + (i - 204) * 64 / 51;
             }
 
-            green = std::max(142, i);
-
+            // last, and only once the sky is already yellow
             if (i > 204) {
-              blue = (5 * i - 1020);
+              blue_ramp = (5 * i - 1020);
             } else {
-              blue = 0;
+              blue_ramp = 0;
             }
 
             // clamp: the curves above run past 255 at the end of the ramp, and
             // Color takes uint8_t - without this they wrap around to dark
-            green = std::min(green, 255);
-            blue = std::min(blue, 255);
-            bright = std::min(bright, 255);
+            red_ramp = std::min(red_ramp, 255);
+            green_ramp = std::min(green_ramp, 255);
+            blue_ramp = std::min(blue_ramp, 255);
+
+            // The channel order used to be Color(green, blue, bright), which
+            // put the blue ramp in the green channel and vice versa. Blue then
+            // rose while green stayed at zero, so the "sunrise" ran dark red ->
+            // magenta -> white. With the ramps in their own channels the curve
+            // does what its segment boundaries were built for: dark red at 0,
+            // orange around 120-180, yellow at 204, white from 255 on.
+            const Color sky = Color(red_ramp, green_ramp, blue_ramp);
+
+            // How far the lit arc has opened from midday, in pixels. Both arms
+            // use the same width - the second one was "j > size - width", one
+            // pixel short, so the ring opened faster clockwise than the other
+            // way round.
+            const int width = i * it.size() / PROGRESS_END;
 
             for (int j = 0; j < it.size(); j++) {
-              if (j < (i * it.size() / PROGRESS_END) || j > (it.size() - (i * it.size() / PROGRESS_END))) {
-                it[j] = Color(green, blue, bright);
+              if (j < width || j >= it.size() - width) {
+                it[j] = sky;
               } else {
                 it[j] = Color(0, 0, 0);
               }
@@ -1330,25 +1393,46 @@ light:
             double cycles = days / SYNODIC_MONTH_DAYS;
             cycles -= std::floor(cycles);
 
-            // 0 = new moon, ~14.8 = full moon
-            const int phase = (int) (cycles * SYNODIC_MONTH_DAYS);
+            // Illuminated fraction of the disc: 0 at new moon, 1 at full. The
+            // ring shows exactly that fraction of itself, so full moon is a
+            // closed circle and new moon is dark.
+            //
+            // This replaces a triangular approximation - "(14 - |14 - phase|)"
+            // scaled to the ring, minus a sixth - which grew the crescent at a
+            // constant rate and, worse, never reached zero: its fade-in edge did
+            // not depend on the phase at all, so ten pixels stayed lit at every
+            // phase including new moon. The cosine is both shorter and correct:
+            // the moon changes slowly around new and full and quickly around the
+            // quarters, which is what you actually see in the sky.
+            constexpr float TWO_PI_F = 6.283185307179586f;
+            const float illuminated = (1.0f - std::cos(TWO_PI_F * (float) cycles)) / 2.0f;
 
-            // how full is the moon based on the phase
-            int fill = it.size() * (14 - (std::abs(14 - phase))) / 14 - it.size() / 6;
+            // in pixels, fractional so the arc grows smoothly across the month
+            const float lit = illuminated * (float) it.size();
 
-            // start on one side, then go back to the other
-            int startPos = it.size() / 5 + fill / 2 + it.size() / 2 * (phase > 14);
+            // The lit limb faces the sun: right while waxing, left while waning.
+            // At full moon the arc closes and the centre stops mattering.
+            const int centre = (cycles < 0.5) ? (it.size() / 4) : (3 * it.size() / 4);
 
             for (int i = 0; i < it.size(); i++) {
-              if (i < fill) {
-                // fill the LEDs in the zone at moon brightness
-                it[(i + 2 * it.size() - startPos) % it.size()] = Color(64, 64, 64);
-              } else {
-                // check if these LEDs are on either side of full-bright and make them semi-bright
-                int bright = std::max((int)(64 - (it.size() - i) * (64 / (it.size() / 6))), std::max(0, (int)((64 - (i - fill) * (64 / (it.size() / 6))))));
-                // add in start pos and % to offset to one side
-                it[(i + 2 * it.size() - startPos) % it.size()] = Color(bright, bright, bright);
+              // distance from the centre of the arc, the short way round
+              int d = std::abs(i - centre);
+              if (d > it.size() / 2) {
+                d = it.size() - d;
               }
+
+              // The arc covers lit pixels in total, so lit/2 either side. The
+              // +1 closes the ring at full moon - without it the single pixel
+              // opposite the centre stays dark and leaves a visible gap. The
+              // fractional result dims the boundary pixel, which is what keeps
+              // a crescent from stepping a whole pixel at a time.
+              float level = 0.0f;
+              if (lit >= 1.0f) {
+                level = std::min(std::max(lit / 2.0f - (float) d + 1.0f, 0.0f), 1.0f);
+              }
+
+              const uint8_t v = (uint8_t) (${MOON_BRIGHTNESS} * level);
+              it[i] = Color(v, v, v);
             }
       - addressable_rainbow:
       - addressable_color_wipe:
