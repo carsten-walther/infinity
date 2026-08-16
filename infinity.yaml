@@ -48,6 +48,22 @@ substitutions:
   DEFAULT_BRIGHTNESS: "70%"
 
   #
+  # Resting colour
+  #
+  # The colour the ring carries underneath the effects. Every effect here writes
+  # its pixels directly and ignores it, so it is only visible in one situation:
+  # no effect running with the light on, which is reachable from the LED color
+  # entity's own effect list ("None" on the Effect select switches the ring off
+  # instead). It is also what the light fades through when an effect starts.
+  #
+  # White because a clock face should not be tinted; set it to something warmer
+  # if the bare ring is ever used as a lamp.
+  #
+  IDLE_RED: "100%"
+  IDLE_GREEN: "100%"
+  IDLE_BLUE: "100%"
+
+  #
   # Ambient light calibration
   #
   # The voltage the LDR divider on ${PIN_BRIGHTNESS} produces at the two ends
@@ -168,9 +184,9 @@ esphome:
         - light.turn_on:
             id: led_ring_id
             brightness: ${DEFAULT_BRIGHTNESS}
-            red: 100%
-            green: 100%
-            blue: 100%
+            red: ${IDLE_RED}
+            green: ${IDLE_GREEN}
+            blue: ${IDLE_BLUE}
             effect: Time
         # Both are pushed rather than polled: the version string is a compile-time
         # constant and the reset count changes once per boot, so an interval could
@@ -762,9 +778,26 @@ select:
     initial_option: "Time"
     optimistic: true
     set_action:
-      - light.turn_on:
-          id: led_ring_id
-          effect: !lambda return x;
+      # "None" switches the ring OFF rather than selecting the absence of an
+      # effect. ESPHome's "None" means "render the light's plain colour", and
+      # that colour is white here - on_boot and on_turn_on both set red, green
+      # and blue to 100% - so picking it lit the whole ring white, which is not
+      # what anyone reaches for a "None" entry expecting.
+      #
+      # The option keeps its ESPHome name because the on_state handler on the
+      # light maps back through it: get_effect_name() reports "None" when no
+      # effect runs, including while the light is off, so the select lands on
+      # this entry either way.
+      - if:
+          condition:
+            lambda: return x == "None";
+          then:
+            - light.turn_off:
+                id: led_ring_id
+          else:
+            - light.turn_on:
+                id: led_ring_id
+                effect: !lambda return x;
 
 #
 # The clock face itself. Every animation below is an addressable_lambda rather
@@ -1302,7 +1335,7 @@ light:
       - light.turn_on:
           id: led_ring_id
           brightness: ${DEFAULT_BRIGHTNESS}
-          red: 100%
-          green: 100%
-          blue: 100%
+          red: ${IDLE_RED}
+          green: ${IDLE_GREEN}
+          blue: ${IDLE_BLUE}
           effect: Time

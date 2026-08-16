@@ -87,6 +87,7 @@ All tunables live in `substitutions:` at the top of `infinity.yaml`:
 | Substitution | Purpose |
 | --- | --- |
 | `DEFAULT_BRIGHTNESS` | brightness the clock returns to on boot and on switch-on |
+| `IDLE_RED` / `IDLE_GREEN` / `IDLE_BLUE` | the colour the ring carries underneath the effects |
 | `AMBIENT_DARK` / `AMBIENT_BRIGHT` | LDR divider voltage in a dark room and in full daylight |
 | `MIN_FACE_BRIGHTNESS` | how far the face may dim at night, as a fraction — never `0` |
 | `DAWN_DURATION_S` | length of the `Dawn` ramp |
@@ -145,7 +146,7 @@ The node is deliberately configured to keep running on its own:
 
 | Entity | Type | Values |
 | --- | --- | --- |
-| `Effect` | Select | any effect from the table below, or `None` |
+| `Effect` | Select | any effect from the table below, or `None` to switch the ring off |
 | `Face type` | Select | `Normal`, `Darken to midday` |
 | `Indicator` | Select | `None`, `Show midday`, `Show quadrants`, `Show hour marks` |
 | `Enable seconds` | Switch | shows the second hand |
@@ -156,6 +157,13 @@ effect list natively in its more-info dialog. The select exists so the effect ca
 on a dashboard as its own control and be set from an automation without a
 `light.turn_on` service call. It syncs both ways: changing the effect on the light
 updates the select.
+
+Its `None` entry switches the ring **off**. In ESPHome, "None" means "no effect, show
+the light's plain colour" — and that colour is white here, because `on_boot` and
+`on_turn_on` both set red, green and blue to 100 %. Picking it therefore lit the whole
+ring white, which is not what a `None` entry suggests. The option keeps its ESPHome
+name so the reverse sync still matches: `get_effect_name()` reports `None` whenever no
+effect runs, the light being off included.
 
 **Diagnostics** — ESPHome Version, Firmware Version, Device Uptime, Uptime,
 Reset Reason, Reset Count, Internal Temperature, SSID, IP Address, DNS Address,
