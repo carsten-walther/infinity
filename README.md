@@ -104,7 +104,8 @@ All tunables live in `substitutions:` at the top of `infinity.yaml`:
 | `FIRE_COOLING` / `FIRE_SPARKING` | how short and how active the `Fire` flames are |
 | `FIRE_MAX_HEAT` | caps the fire palette short of white — raise towards `255` for white tips |
 | `ALARM_RED` / `ALARM_GREEN` / `ALARM_BLUE` | peak colour of the `Alarm` pulse |
-| `MIDDAY_DARKEN` | how far the `Darken to midday` face dims the arc behind the trailing hand |
+| `GRADIENT_DIM` | how far the `Gradient` face dims its ramps, so the hands still stand out |
+| `NUM_LEDS` | ring size — see the note above, this is not a free parameter |
 | `PIN_LED_RING` / `PIN_BRIGHTNESS` | see the pin table above before changing |
 
 `AMBIENT_DARK` and `AMBIENT_BRIGHT` are in **volts**, matching what the
@@ -181,34 +182,35 @@ default clock, higher receive current — and no working die sensor to measure i
 
 | Entity | Type | Values |
 | --- | --- | --- |
-| `Effect` | Select | any effect from the table below, or `Off` to switch the ring off |
-| `Face type` | Select | `Normal`, `Darken to midday` |
+| `Face type` | Select | `Normal`, `Simple`, `Gradient` |
 | `Indicator` | Select | `Off`, `Show midday`, `Show quadrants`, `Show hour marks` |
 | `Enable seconds` | Switch | shows the second hand |
 | `Color hour` / `Color minute` / `Color second` | Text | hex colour, e.g. `#FF0000` |
 | `Latitude` / `Longitude` | Text | decimal degrees, north and east positive — drives the `Sun` and `Moon` effects |
 | `Alarm Time` | Datetime | daily alarm, switches the ring to the `Alarm` effect |
 | `Alarm Enabled` | Switch | arms `Alarm Time` without losing the setting |
+| `Alarm Duration` | Number | minutes the alarm pulses before standing down, 1–60 |
 
-`Effect` is a convenience wrapper — the `LED color` light entity already carries the
-effect list natively in its more-info dialog. The select exists so the effect can sit
-on a dashboard as its own control and be set from an automation without a
-`light.turn_on` service call. It syncs both ways: changing the effect on the light
-updates the select.
+The alarm switches the ring on, selects the `Alarm` effect, and stands down by itself
+after `Alarm Duration` minutes. There is deliberately no snooze.
 
-Its `Off` entry switches the ring **off**. In ESPHome that entry is called `None` and
-means "no effect, show the light's plain colour" — which is white here, because
-`on_boot` and `on_turn_on` set the `IDLE_*` colour. Picking it therefore lit the whole
-ring white, which is not what the entry suggests.
+Standing down restores what was there before: if the ring had been off, it goes back
+off; if it had been showing the clock, it returns to the clock. It also checks that the
+alarm is still what is showing — someone who silenced it early by picking another
+effect has already dealt with it, and changing the display out from under them minutes
+later would be worse than doing nothing.
 
-**No select here offers an option literally named `None`, deliberately.** Home
-Assistant's MQTT integration treats the payload `None` as its `PAYLOAD_NONE` sentinel,
-meaning "no state" — an entity resting on that value shows as `unknown` in the UI
-rather than displaying the selected entry. Both `Effect` and `Indicator` therefore use
-`Off` for their first option. It costs nothing: the effects switch on
-`active_index()`, and `restore_value` stores the index too, so no logic depends on the
-string. The light's `on_state` handler translates between ESPHome's `None` and the
-select's `Off` so the two stay in step.
+The script runs in `mode: restart`, so an alarm firing while a previous one is still
+running restarts the timer rather than queueing a second stand-down.
+
+The light's `on_turn_on` handler only normalises a switch-on that did not ask for a
+specific effect — otherwise it would override the alarm the instant it fired.
+
+Effects are set on the `LED color` light entity itself — Home Assistant lists them in
+its more-info dialog, and automations use `light.turn_on` with `effect:`. There is
+deliberately no separate `Effect` select: it duplicated a native capability, and its
+option list was a hand-maintained copy of the effect names, which is the most
+drift-prone thing a config like this can carry.
 
 **Diagnostics** — ESPHome Version, Firmware Version, Device Uptime, Uptime,
 Reset Reason, Reset Count, Internal Temperature, Sun Elevation, Moon Altitude,
@@ -351,6 +353,21 @@ rather than left to the schema defaults, which are `ALWAYS_OFF` and `false` — 
 defaults every setting was silently lost on each restart. `initial_value` /
 `initial_option` therefore only apply on the very first boot, or after a factory
 reset.
+
+The three faces:
+
+| Face | What it draws |
+| --- | --- |
+| `Normal` | the two arcs between the hands, each in a flat hand colour |
+| `Simple` | the hands as bare dots on a dark ring |
+| `Gradient` | both arcs as colour ramps — hour colour to minute colour one way round, minute back to hour the other |
+
+`Gradient` dims its ramps to `GRADIENT_DIM` and paints the hands over them at full
+strength. Without that the hands would vanish: a gradient is by definition almost the
+same colour either side of any point on it.
+
+`Indicator` and `Enable seconds` apply to every face, so hour marks and a second dot
+work on `Simple` and `Gradient` too.
 
 The option **order** of `Face type` and `Indicator` is load-bearing: the `Time` effect
 switches on `active_index()`, so reordering or inserting an option silently remaps the

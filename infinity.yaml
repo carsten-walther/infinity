@@ -41,16 +41,13 @@ substitutions:
   NUM_LEDS: "60"
 
   #
-  # How far the "Darken to midday" face dims the arc behind the trailing hand,
-  # as a fraction of what is already there. 0.15 keeps a visible trace; 0 blanks
-  # it completely.
+  # How far the "Gradient" face dims its two colour ramps, as a fraction. The
+  # hands themselves are painted at full strength on top, so this is what makes
+  # them stand out - at 1.0 they dissolve into the ramp they sit in the middle
+  # of, because a gradient is by definition nearly the same colour either side
+  # of any point on it.
   #
-  # This scales the colour rather than subtracting a fixed amount from each
-  # channel, which is what it used to do - subtracting 240 out of 255 left at
-  # most 15 per channel, so it erased the arc instead of darkening it, and it
-  # shifted the hue on the way because the channels hit zero at different points.
-  #
-  MIDDAY_DARKEN: "0.15"
+  GRADIENT_DIM: "0.35"
 
   #
   # Brightness the clock comes back to on boot and on every switch-on. 60 LEDs
@@ -509,6 +506,17 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'true'
+
+  #
+  # Whether the ring was already on when the alarm fired. The alarm has to
+  # switch it on to be of any use, so without remembering this it could not tell
+  # "it was off, put it back" from "it was showing the clock, leave it showing
+  # the clock" when the timer runs out.
+  #
+  - id: global_alarm_was_on
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
 #
 # The one place solar and lunar position are computed. Runs on its own clock so
@@ -1112,6 +1120,74 @@ sensor:
       return id(reset_count_id);
 
 #
+# https://esphome.io/components/script
+#
+# mode: restart, so an alarm that fires while a previous one is still running
+# starts its timer over instead of queueing a second stand-down.
+#
+script:
+  - id: alarm_script
+    mode: restart
+    then:
+      - lambda: |-
+          id(global_alarm_was_on) = id(led_ring_id).remote_values.is_on();
+
+      # turn_on rather than only setting the effect: the ring may well be off at
+      # the time, which is rather the point of an alarm.
+      - light.turn_on:
+          id: led_ring_id
+          brightness: 100%
+          effect: Alarm
+
+      # Minutes to milliseconds. The number entity is the only thing that
+      # decides how long this runs.
+      - delay: !lambda |-
+          return (uint32_t) (id(alarm_duration_id).state * 60000.0f);
+
+      # Only stand down if the alarm is still what is showing. Someone who
+      # silenced it by picking another effect - or by switching the ring off -
+      # has already dealt with it, and yanking the display out from under them
+      # minutes later would be worse than doing nothing.
+      - if:
+          condition:
+            lambda: return id(led_ring_id).get_effect_name().str() == "Alarm";
+          then:
+            - if:
+                condition:
+                  lambda: return id(global_alarm_was_on);
+                then:
+                  - light.turn_on:
+                      id: led_ring_id
+                      brightness: ${DEFAULT_BRIGHTNESS}
+                      red: ${IDLE_RED}
+                      green: ${IDLE_GREEN}
+                      blue: ${IDLE_BLUE}
+                      effect: Time
+                else:
+                  - light.turn_off: led_ring_id
+
+#
+# https://esphome.io/components/number/template
+#
+# How long the alarm pulses before standing down on its own. There is
+# deliberately no snooze - this is a clock, not a bedside console.
+#
+number:
+  - platform: template
+    id: alarm_duration_id
+    name: Alarm Duration
+    icon: mdi:timer-outline
+    unit_of_measurement: min
+    mode: box
+    min_value: 1
+    max_value: 60
+    step: 1
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    entity_category: config
+
+#
 # https://esphome.io/components/datetime/template
 #
 # Turns the Alarm effect from something you pick by hand into an actual alarm.
@@ -1135,12 +1211,7 @@ datetime:
           condition:
             switch.is_on: alarm_enabled_id
           then:
-            # turn_on rather than only setting the effect: the ring may well be
-            # off at the time, which is rather the point of an alarm.
-            - light.turn_on:
-                id: led_ring_id
-                brightness: 100%
-                effect: Alarm
+            - script.execute: alarm_script
 
 #
 # https://esphome.io/components/switch/template
@@ -1209,7 +1280,7 @@ text:
     entity_category: config
     min_length: 7
     max_length: 7
-    initial_value: '#FF14C0'
+    initial_value: '#1006cd'
 
   - platform: template
     name: Color minute
@@ -1221,7 +1292,7 @@ text:
     entity_category: config
     min_length: 7
     max_length: 7
-    initial_value: '#63D460'
+    initial_value: '#d200b6'
 
   - platform: template
     name: Color second
@@ -1233,7 +1304,7 @@ text:
     entity_category: config
     min_length: 7
     max_length: 7
-    initial_value: '#0000FF'
+    initial_value: '#2DFF49'
 
   #
   # Where the device is, in decimal degrees, north and east positive. The Sun
@@ -1275,7 +1346,7 @@ text:
 # in these lists. Reordering or inserting an option silently remaps the face.
 #
 # restore_value on both: without it the schema default is false and every reboot
-# reset the face to Normal / None. initial_option only applies on the very first
+# reset the face to Normal / Off. initial_option only applies on the very first
 # boot now, or after a factory reset.
 #
 # https://esphome.io/components/select/template
@@ -1288,7 +1359,8 @@ select:
     id: infinity_face_type
     options:
       - "Normal"
-      - "Darken to midday"
+      - "Simple"
+      - "Gradient"
     initial_option: "Normal"
     optimistic: true
     restore_value: true
@@ -1311,68 +1383,6 @@ select:
     initial_option: "Off"
     optimistic: true
     restore_value: true
-
-  #
-  # Effect
-  #
-  # The light entity already carries the effect list natively - Home Assistant
-  # shows it in the more-info dialog of "LED color". This select is a
-  # convenience wrapper so the effect can sit on a dashboard as its own control
-  # and be addressed from an automation without a light.turn_on service call.
-  #
-  # Every option name must match an effect name below EXACTLY - set_action
-  # passes the string straight to light.turn_on. The one exception is "Off",
-  # which is handled before that and translated in both directions by the
-  # light's on_state handler.
-  #
-  # THIS LIST IS MAINTAINED BY HAND. ESPHome cannot generate it from the light's
-  # effects, so adding an effect down there without adding it here leaves it
-  # reachable only from the LED color entity, and a typo leaves an option that
-  # silently does nothing. The matching note sits on the light's effects block.
-  #
-  - platform: template
-    name: Effect
-    icon: mdi:auto-fix
-    id: effect_select_id
-    options:
-      - "Off"
-      - "Time"
-      - "Sun"
-      - "Moon"
-      - "Alarm"
-      - "Fire"
-      - "Rainbow"
-      - "Color Wipe"
-      - "Scan"
-      - "Twinkle"
-      - "Random Twinkle"
-      - "Fireworks"
-      - "Addressable Flicker"
-    initial_option: "Time"
-    optimistic: true
-    restore_value: true
-    set_action:
-      # "Off" switches the ring off rather than selecting the absence of an
-      # effect. ESPHome calls that entry "None" and means "render the light's
-      # plain colour" by it - and that colour is white here, since on_boot and
-      # on_turn_on both set red, green and blue to IDLE_*. Picking it lit the
-      # whole ring white, which is not what the entry suggests.
-      #
-      # The rename to "Off" is also what keeps the entity readable in Home
-      # Assistant: its MQTT integration treats the literal payload "None" as
-      # PAYLOAD_NONE, i.e. "no state", so a select resting on it shows up as
-      # "unknown". The light's on_state handler translates between the two
-      # names, so ESPHome's "None" and this "Off" stay in step.
-      - if:
-          condition:
-            lambda: return x == "Off";
-          then:
-            - light.turn_off:
-                id: led_ring_id
-          else:
-            - light.turn_on:
-                id: led_ring_id
-                effect: !lambda return x;
 
 #
 # The clock face itself. Every animation below is an addressable_lambda rather
@@ -1402,9 +1412,6 @@ light:
 
     effects:
 
-      # Adding or renaming anything here means updating the Effect select's
-      # option list too - it is a hand-maintained copy of these names.
-
       #
       # The clock face. Hour and minute hand are drawn as a gradient around the
       # ring, so the two arcs between them carry the reading even when a hand
@@ -1420,7 +1427,8 @@ light:
           lambda: |-
             // face types
             constexpr int FACETYPE_NORMAL = 0;
-            constexpr int FACETYPE_DARKEN_TO_MIDDAY = 1;
+            constexpr int FACETYPE_SIMPLE = 1;
+            constexpr int FACETYPE_GRADIENT = 2;
 
             // indicators
             constexpr int INDICATOR_SHOW_NONE = 0;
@@ -1435,7 +1443,7 @@ light:
             };
 
             // Scales a colour towards black. Multiplicative on purpose - see
-            // MIDDAY_DARKEN for why subtracting a fixed delta was wrong.
+            // GRADIENT_DIM for why subtracting a fixed delta was wrong.
             auto darken = [](Color color, float factor) -> Color {
               return Color(color.r * factor, color.g * factor, color.b * factor);
             };
@@ -1543,46 +1551,64 @@ light:
             c2blend = linearBlend(c2, c1, (float) blendPoint / 255);
             c1blend = linearBlend(c1, c2, (float) blendPoint / 255);
 
-            gap = secondhand - firsthand;
+            // "Simple" shows the hands as bare dots, so there is no gradient to
+            // build. The ring has to be cleared explicitly: the frame buffer is
+            // live and still holds whatever the last frame drew, so without
+            // this the gradient from before the switch would simply stay put.
+            const size_t faceType = face_type.value_or(FACETYPE_NORMAL);
 
-            // create the blend between first and 2nd hand
-            for (int i = firsthand; i < secondhand; i++) {
-              it[i] = linearBlend(c2blend, c2, ((float) i - (float) firsthand) / (float) gap);
-            }
+            if (faceType == FACETYPE_SIMPLE) {
+              for (int i = 0; i < it.size(); i++) {
+                it[i] = Color(0, 0, 0);
+              }
+            } else if (faceType == FACETYPE_GRADIENT) {
+              // Two ramps, each spanning one of the arcs between the hands:
+              // hour colour to minute colour going clockwise from the hour
+              // hand, and minute back to hour over the remainder. Both ends of
+              // each ramp land exactly on a hand, so the ring closes on itself
+              // with no seam.
+              //
+              // Drawn dimmed, because a gradient is by definition almost the
+              // same colour either side of any point on it - at full strength
+              // the hands would be indistinguishable from their surroundings.
+              // They are painted over this at full colour further down.
+              const int span = (minute_pos - hour_pos + it.size()) % it.size();
+              const int back = it.size() - span;
 
-            gap = it.size() - gap;
+              for (int k = 0; k <= span; k++) {
+                const float t = (span == 0) ? 0.0f : (float) k / (float) span;
+                it[(hour_pos + k) % it.size()] =
+                    darken(linearBlend(hour_color, minute_color, t), ${GRADIENT_DIM}f);
+              }
 
-            // and the last hand
-            for (int i = secondhand; i < it.size() + firsthand; i++) {
-              it[i % it.size()] = linearBlend(c1blend, c1, ((float) i - (float) secondhand) / (float) gap);
-            }
+              for (int k = 0; k <= back; k++) {
+                const float t = (back == 0) ? 0.0f : (float) k / (float) back;
+                it[(minute_pos + k) % it.size()] =
+                    darken(linearBlend(minute_color, hour_color, t), ${GRADIENT_DIM}f);
+              }
+            } else {
+              gap = secondhand - firsthand;
 
-            it[hour_pos] = hour_color;
-            it[minute_pos] = minute_color;
+              // create the blend between first and 2nd hand
+              for (int i = firsthand; i < secondhand; i++) {
+                it[i] = linearBlend(c2blend, c2, ((float) i - (float) firsthand) / (float) gap);
+              }
 
-            // face types
-            switch (face_type.value()) {
-              default:
-                break;
-              case FACETYPE_NORMAL:
-                break;
-              case FACETYPE_DARKEN_TO_MIDDAY: {
-                // Darkens everything between the trailing hand and midday
-                // (pixel 0), so the eye is drawn to the arc the hands span.
-                //
-                // Starts at secondhand + 1, not at secondhand: that pixel IS
-                // the trailing hand, and including it darkened the hand away.
-                // At 15:07 the hour hand was the trailing one and simply
-                // vanished.
-                for (int i = secondhand + 1; i < it.size(); i++) {
-                  it[i] = darken(it[i].get(), ${MIDDAY_DARKEN}f);
-                }
-                break;
+              gap = it.size() - gap;
+
+              // and the last hand
+              for (int i = secondhand; i < it.size() + firsthand; i++) {
+                it[i % it.size()] = linearBlend(c1blend, c1, ((float) i - (float) secondhand) / (float) gap);
               }
             }
 
+            // Drawn for every face type, and last, so the hands sit on top of
+            // the gradient rather than being blended into it.
+            it[hour_pos] = hour_color;
+            it[minute_pos] = minute_color;
+
             // indicator
-            switch (indicator.value()) {
+            switch (indicator.value_or(INDICATOR_SHOW_NONE)) {
               default:
                 break;
               case INDICATOR_SHOW_NONE:
@@ -1616,6 +1642,48 @@ light:
                 const Color c = it[k].get();
                 it[k] = Color(c.r * dim, c.g * dim, c.b * dim);
               }
+            }
+
+      #
+      # Red pulse.
+      #
+      - addressable_lambda:
+          name: Alarm
+          update_interval: 30ms
+          lambda: |-
+            // The original ran both ramps, 0 -> 255 and back, inside a single
+            // call. Nothing is shown between writes to the frame buffer, so only
+            // the last pass survived - the strip rendered flat black and the
+            // effect did nothing at all. The ramp has to advance one step per
+            // FRAME, which is what the counter below does.
+            //
+            // 8 per 30ms frame is ~1s per ramp, so a full pulse takes ~2s.
+            constexpr int STEP = 8;
+
+            static int level = 0;
+            static int direction = 1;
+
+            if (initial_run) {
+              level = 0;
+              direction = 1;
+            }
+
+            level += direction * STEP;
+
+            if (level >= 255) {
+              level = 255;
+              direction = -1;
+            } else if (level <= 0) {
+              level = 0;
+              direction = 1;
+            }
+
+            // Deliberately NOT dimmed by global_ambient_dim, unlike every
+            // other effect here: an alarm that turns itself down in a dark room
+            // is an alarm that fails at the one time it is needed.
+            const Color color = Color(${ALARM_RED} * level, ${ALARM_GREEN} * level, ${ALARM_BLUE} * level);
+            for (int i = 0; i < it.size(); i++) {
+              it[i] = color;
             }
 
       #
@@ -1764,47 +1832,7 @@ light:
                 it[k] = Color(c.r * dim, c.g * dim, c.b * dim);
               }
             }
-      #
-      # Red pulse.
-      #
-      - addressable_lambda:
-          name: Alarm
-          update_interval: 30ms
-          lambda: |-
-            // The original ran both ramps, 0 -> 255 and back, inside a single
-            // call. Nothing is shown between writes to the frame buffer, so only
-            // the last pass survived - the strip rendered flat black and the
-            // effect did nothing at all. The ramp has to advance one step per
-            // FRAME, which is what the counter below does.
-            //
-            // 8 per 30ms frame is ~1s per ramp, so a full pulse takes ~2s.
-            constexpr int STEP = 8;
 
-            static int level = 0;
-            static int direction = 1;
-
-            if (initial_run) {
-              level = 0;
-              direction = 1;
-            }
-
-            level += direction * STEP;
-
-            if (level >= 255) {
-              level = 255;
-              direction = -1;
-            } else if (level <= 0) {
-              level = 0;
-              direction = 1;
-            }
-
-            // Deliberately NOT dimmed by global_ambient_dim, unlike every
-            // other effect here: an alarm that turns itself down in a dark room
-            // is an alarm that fails at the one time it is needed.
-            const Color color = Color(${ALARM_RED} * level, ${ALARM_GREEN} * level, ${ALARM_BLUE} * level);
-            for (int i = 0; i < it.size(); i++) {
-              it[i] = color;
-            }
       #
       # Real-time simulation of the sun. The ring lights at 12 o'clock the
       # moment the sun clears the horizon and opens outwards from there as it
@@ -1889,6 +1917,7 @@ light:
                 it[k] = Color(c.r * dim, c.g * dim, c.b * dim);
               }
             }
+
       #
       # Current moon phase as a lit segment.
       #
@@ -1953,42 +1982,52 @@ light:
                 it[k] = Color(c.r * dim, c.g * dim, c.b * dim);
               }
             }
-      - addressable_rainbow:
-      - addressable_color_wipe:
-      - addressable_scan:
-      - addressable_twinkle:
-      - addressable_random_twinkle:
-      - addressable_fireworks:
-      - addressable_flicker:
 
-    # Keeps the Effect select in step when the effect is changed anywhere else -
-    # from the light entity itself, from on_boot, or from on_turn_on below.
-    #
-    # publish_state, NOT make_call: a call would run the select's set_action,
-    # which calls light.turn_on, which fires on_state again. publish_state only
-    # updates the reported value, so the loop cannot start. The equality check
-    # additionally keeps this from republishing on every unrelated light state
-    # change - brightness, colour, on/off all land here too.
-    on_state:
-      - lambda: |-
-          // ESPHome reports "None" when no effect is running, the light being
-          // off included. The select calls that entry "Off" - see the comment
-          // on its set_action for why - so translate here rather than letting
-          // the two drift apart.
-          const std::string effect = id(led_ring_id).get_effect_name().str();
-          const std::string option = (effect == "None") ? "Off" : effect;
-          if (id(effect_select_id).current_option().str() != option &&
-              id(effect_select_id).has_option(option)) {
-            id(effect_select_id).publish_state(option);
-          }
+      - addressable_rainbow:
+          name: Rainbow
+          speed: 10
+          width: 50
+
+      - addressable_color_wipe:
+          name: Color Wipe
+          add_led_interval: 100ms
+          reverse: false
+
+      - addressable_fireworks:
+          name: Fireworks
+          update_interval: 32ms
+          spark_probability: 10%
+          use_random_color: false
+          fade_out_rate: 120
+
+      - addressable_twinkle:
+          name: Twinkle
+          twinkle_probability: 5%
+          progress_interval: 4ms
+
+      - addressable_random_twinkle:
+          name: Random Twinkle
+          twinkle_probability: 5%
+          progress_interval: 32ms
 
     # Switching the light on always lands on the clock face at a known
     # brightness, whatever effect or colour was last set from Home Assistant.
     on_turn_on:
-      - light.turn_on:
-          id: led_ring_id
-          brightness: ${DEFAULT_BRIGHTNESS}
-          red: ${IDLE_RED}
-          green: ${IDLE_GREEN}
-          blue: ${IDLE_BLUE}
-          effect: Time
+      # Only normalises a switch-on that did not ask for anything specific.
+      #
+      # Without the guard this fires for EVERY turn_on and overrides the effect
+      # that was just requested - the alarm would set Alarm, this trigger would
+      # immediately put it back to Time, and the ring would never pulse. By the
+      # time the trigger runs the call has already applied its effect, so
+      # "None" here means "switched on without one".
+      - if:
+          condition:
+            lambda: return id(led_ring_id).get_effect_name().str() == "None";
+          then:
+            - light.turn_on:
+                id: led_ring_id
+                brightness: ${DEFAULT_BRIGHTNESS}
+                red: ${IDLE_RED}
+                green: ${IDLE_GREEN}
+                blue: ${IDLE_BLUE}
+                effect: Time
