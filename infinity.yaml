@@ -72,8 +72,8 @@ substitutions:
   # for perception - low values come out brighter than they read here.
   #
   IDLE_RED: "100%"
-  IDLE_GREEN: "60%"
-  IDLE_BLUE: "20%"
+  IDLE_GREEN: "100%"
+  IDLE_BLUE: "100%"
 
   #
   # Ambient light calibration
