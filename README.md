@@ -166,8 +166,20 @@ none of that came from the strip. Two settings brought it down to **38–41 °C*
   to one beacon interval (typically 100–300 ms); outbound publishes and the clock
   itself are unaffected. If OTA updates start failing, this is the first thing to put
   back to `NONE`.
-- `cpu_frequency: 80MHZ` — half the default. Nothing here is compute-bound; raise it
-  back to `160MHZ` if an effect ever stutters.
+- `cpu_frequency: 80MHZ` — half the default. **This one has since been reverted**, see
+  below; the 38–41 °C figure was measured with it in place and so understates what the
+  power save mode is worth on its own.
+
+`cpu_frequency` is back at the variant default of `160MHZ`. Halving the clock looked
+free — nothing here is compute-bound — but it also halves the margin on **interrupt
+latency**, and the LED ring depends on that. `esp32_rmt_led_strip` drives the strip
+from a 96-symbol RMT buffer (the C3 maximum: two 48-symbol blocks, so there is no
+headroom to configure), which at WS2811 timing holds about 133 µs of data. The refill
+ISR therefore has to run every ~67 µs for the whole ~2 ms a frame takes. Miss it once
+and every LED past that point takes shifted bits — a handful of pixels in the wrong
+colour for one frame, on a chip that is also servicing WiFi, the API, MQTT and a web
+server. If the die runs hotter than wanted, take it out of `power_save_mode` or the
+brightness setting rather than out of the clock.
 
 `output_power: 12dB` is a reduction from the ~20 dBm default, but it barely matters —
 this node transmits well under 0.1 % of the time. Do not go lower: at the measured
@@ -192,7 +204,7 @@ default clock, higher receive current — and no working die sensor to measure i
 | `Latitude` / `Longitude` | Text | decimal degrees, north and east positive — drives the `Sun` and `Moon` effects |
 | `Alarm Time` | Datetime | daily alarm, switches the ring to the `Alarm` effect |
 | `Alarm Enabled` | Switch | arms `Alarm Time` without losing the setting |
-| `Alarm Duration` | Number | minutes the alarm pulses before standing down, 1–60 |
+| `Alarm Duration` | Number | minutes the alarm pulses before standing down, 1–10 |
 | `MQTT` | Switch | brings the broker connection up or down — off after every boot |
 
 The alarm switches the ring on, selects the `Alarm` effect, and stands down by itself
@@ -216,7 +228,7 @@ deliberately no separate `Effect` select: it duplicated a native capability, and
 option list was a hand-maintained copy of the effect names, which is the most
 drift-prone thing a config like this can carry.
 
-**Diagnostics** — ESPHome Version, Firmware Version, Device Uptime, Uptime,
+**Diagnostics** — ESPHome Version, Firmware Version, Device Uptime,
 Reset Reason, Reset Count, Sun Elevation, Moon Altitude,
 Moon Illumination, Moon Phase, SSID, IP Address, DNS Address, Connection Status,
 WiFi Signal (dBm), WiFi Signal (%), Brightness.
@@ -245,6 +257,10 @@ you *that* it restarted while nobody was watching. Read both against `Device Upt
 a rising count at a low uptime is a device rebooting in a loop. The count survives
 restarts and is only cleared by a factory reset.
 
+The raw `Uptime` sensor behind `Device Uptime` is `internal: True` and never reaches
+Home Assistant: it exists only to be formatted into the human-readable string, and
+publishing both would be the same number twice.
+
 **Buttons** — Restart, Restart (Safe Mode), Factory Reset.
 
 ## Effects
@@ -259,8 +275,9 @@ restarts and is only cleared by a factory reset.
 
 Plus five ESPHome built-ins: Rainbow, Color Wipe, Fireworks, Twinkle and Random
 Twinkle. Two things separate them from the five lambdas above. They do **not** follow
-the room light — `global_ambient_dim` is applied inside each lambda and a built-in has
-none, so Rainbow at night stays as bright as the brightness setting says. And `Twinkle`
+the room light — `global_ambient_dim` is applied inside four of those five lambdas
+(`Alarm` opts out on purpose) and a built-in has no lambda to put it in, so Rainbow at
+night stays as bright as the brightness setting says. And `Twinkle`
 doubles as the boot indicator: the handover to the clock face tests for it by name, so
 selecting `Twinkle` by hand means the next reconnect or SNTP sync will quietly replace
 it with `Time`.
@@ -321,10 +338,12 @@ The arc is normalised against the highest the sun gets *that day*
 (`90° − |latitude − declination|`), so the ring closes at local noon in December as
 well as in June.
 
-The position comes from the low-precision solar algorithm in the Astronomical Almanac,
-accurate to well under a tenth of a degree — a hundred times finer than one pixel of
-this ring. It reads UTC from the clock, so the `Europe/Berlin` timezone affects only
-the clock face, not this.
+The position comes from Schlyter's orbital elements, cross-checked against the
+Astronomical Almanac's low-precision solar formula (see *Architecture*) and accurate to
+well under a tenth of a degree — a hundred times finer than one pixel of this ring. It
+reads UTC from the clock, so the `Europe/Berlin` timezone affects only the clock face,
+not this. The elevation itself is computed by the shared `interval: 10s`, not by the
+effect; the effect only draws the arc.
 
 ### Where the coordinates come from
 
@@ -334,9 +353,13 @@ effects read. Two
 attributes and write them into those entities, so a device added through the ESPHome
 integration is correct without anyone typing anything.
 
-The `Color …`, `Latitude` and `Longitude` entities all sit in Home Assistant's
-**configuration** category rather than among the controls — they are set once and then
-left alone.
+`entity_category` splits the entities by how often they are touched. The `Color …`
+entities, `Latitude`, `Longitude`, `Alarm Duration` and `MQTT` sit in Home Assistant's
+**configuration** category — set once and then left alone. `Face type`, `Indicator`,
+`Enable seconds`, `Alarm Time` and `Alarm Enabled` are plain **controls**: they are
+what you actually reach for, and burying them behind the configuration fold made the
+clock harder to use than it needed to be. `Brightness` is a **diagnostic** — it reports
+the room, nothing sets it.
 
 **Home Assistant wins.** Editing the entities by hand works, but the next time HA
 connects or `zone.home` changes it overwrites them. Delete the two `homeassistant`
@@ -400,12 +423,20 @@ showing whatever it was showing until the new firmware boots. See *Known limitat
 
 ## State that survives a reboot
 
-`Enable seconds`, `Face type`, `Indicator` and the three `Color …` entities all
-persist. Their `restore_mode` / `restore_value` settings are spelled out in the YAML
-rather than left to the schema defaults, which are `ALWAYS_OFF` and `false` — with the
-defaults every setting was silently lost on each restart. `initial_value` /
-`initial_option` therefore only apply on the very first boot, or after a factory
-reset.
+Twelve values persist: the three `Color …` entities, `Latitude` and `Longitude`,
+`Alarm Time`, `Alarm Duration` and `Alarm Enabled`, `Face type` and `Indicator`,
+`Enable seconds`, and the `Reset Count`. The `MQTT` switch is deliberately **not**
+among them — `ALWAYS_OFF` neither reads nor writes a preference.
+
+Their `restore_mode` / `restore_value` settings are spelled out in the YAML rather than
+left to the schema defaults, which are `ALWAYS_OFF` and `false` — with the defaults
+every setting was silently lost on each restart. `initial_value` / `initial_option`
+therefore only apply on the very first boot, or after a factory reset.
+
+All twelve land in the same flash sector, which is why `preferences:` sets
+`flash_write_interval: 5min` instead of the default 60 s: it folds a burst of
+slider-dragging in Home Assistant into one erase cycle. The cost either way is that a
+change made less than the interval before a power cut is lost.
 
 The three faces:
 
@@ -426,6 +457,13 @@ work on `Simple` and `Gradient` too.
 twelve hours. The names describe positions rather than times of day: pixel 0 is where
 both noon and midnight land, so the old `Show midday` was wrong for half of every day,
 and `Show quadrants` named the sectors when what it draws are the marks between them.
+
+A mark is the **inverse of the luminance** of the face around it: a neutral grey, bright
+over a dark surround and dark over a bright one. It used to invert each colour channel
+instead, which on a saturated face produced the complement — a cyan mark on a red arc, a
+magenta one on green — and it was computed after the hands were drawn, so every mark
+also shifted as a hand slid past it. The marks are now drawn with the face, before the
+hands, and carry no hue of their own.
 
 The option **order** of `Face type` and `Indicator` is load-bearing (renaming is safe,
 `restore_value` stores the index too): the `Time` effect

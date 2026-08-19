@@ -78,9 +78,11 @@ substitutions:
   # the LED color entity's own effect list. It is also what the light fades
   # through when an effect starts.
   #
-  # Warm white rather than flat 100/100/100. Note that gamma_correct is 1.0 on
+  # Flat white, all three channels equal. Note that gamma_correct is 1.0 on
   # this light, so these percentages go to the LEDs linearly and not corrected
-  # for perception - low values come out brighter than they read here.
+  # for perception - low values come out brighter than they read here. Pulling
+  # blue down is what gives a warm white; nothing here depends on that, so it
+  # is left to whoever wants it.
   #
   IDLE_RED: "100%"
   IDLE_GREEN: "100%"
@@ -119,7 +121,7 @@ substitutions:
   # own brightness setting. Never 0 - a clock that reads as "off" in a dark room
   # is worse than one that is slightly too bright.
   #
-  MIN_FACE_BRIGHTNESS: "0.15"
+  MIN_FACE_BRIGHTNESS: "0.10"
 
   #
   # Hand movement
@@ -135,7 +137,7 @@ substitutions:
   # TAIL is the length of the trail in pixels. Needs a decimal point: the lambda
   # appends "f" to build a float literal.
   #
-  HAND_FADE_MS: "400"
+  HAND_FADE_MS: "999"
   HAND_TAIL: "3.0"
 
   #
@@ -173,9 +175,11 @@ substitutions:
   # given frame. Higher is a more active fire. Sensible range 50-200.
   #
   # MAX_HEAT: caps the palette lookup. The heat-to-colour ramp runs
-  # black -> red -> orange -> yellow -> white, and the white only starts above
-  # ~170. Clamping there keeps even the hottest cells yellow. Raise it towards
-  # 255 to let the white tips back in.
+  # black -> red -> orange -> yellow -> white, and the blue channel - the white
+  # - only starts to climb above a heat of ~171. 190 sits just past that, so
+  # the hottest cells come out at (255, 255, 56): yellow with a wash on it,
+  # rather than the (255, 255, 252) that an uncapped 255 reaches. Raise it
+  # towards 255 to let the white tips back in, or below 171 for flat yellow.
   #
   FIRE_COOLING: "55"
   FIRE_SPARKING: "120"
@@ -281,13 +285,24 @@ esphome:
 esp32:
   board: esp32-c3-devkitm-1
 
-  # Half the 160 MHz this variant defaults to. Dynamic power scales with clock,
-  # so this is the second lever against the die temperature after the WiFi power
-  # save mode - smaller than that one, and unlike it, free: nothing here is
-  # compute-bound. The heaviest load is the Fire effect at 30 ms over 30 heat
-  # cells, and Time at 500 ms over 60 pixels; an ESP8266 does comparable work at
-  # this clock. Raise it back to 160MHZ if an effect ever starts stuttering.
-  cpu_frequency: 80MHZ
+  # The variant default, and back at it after a spell at 80MHZ.
+  #
+  # 80 was the second lever against the die temperature, after the WiFi power
+  # save mode below, and it looked free: nothing here is compute-bound. The
+  # heaviest load is the Fire effect at 30 ms over 30 heat cells, and Time at
+  # 50 ms over 60 pixels.
+  #
+  # What it was not free of is INTERRUPT latency. The LED ring is driven from
+  # RMT with a 96-symbol buffer - the C3 maximum, two 48-symbol blocks - which
+  # at WS2811 timing is about 133 us of data, so the refill ISR has to run
+  # every ~67 us for the whole 2 ms of a frame. Miss it once and every LED
+  # after that point takes shifted bits: a handful of pixels in the wrong
+  # colour for one frame. Halving the clock halves the margin on that, on a
+  # chip that is also servicing WiFi, the api, mqtt and a web server.
+  #
+  # If the die runs hotter than wanted, take it out of power_save_mode or the
+  # brightness, not out of this.
+  cpu_frequency: 160MHZ
 
   framework:
     # esp-idf, not arduino: the only thing that tied this device to arduino was
@@ -302,11 +317,14 @@ esp32:
     type: esp-idf
 
 #
-# Eight things persist here - the three hand colours, the two coordinates, the
-# alarm time and duration, both selects, the seconds switch and the reset count
-# - and every one of them lands in the same flash sector. The default buffers
-# writes for 60s; 5min buffers a burst of slider-dragging in Home Assistant into
-# a single erase cycle instead of several.
+# Twelve things persist here - the three hand colours, the two coordinates, the
+# alarm time, its duration and its arming switch, both selects, the seconds
+# switch and the reset count - and every one of them lands in the same flash
+# sector. The MQTT switch is not among them: it is ALWAYS_OFF, which neither
+# reads nor writes a preference.
+#
+# The default buffers writes for 60s; 5min buffers a burst of slider-dragging in
+# Home Assistant into a single erase cycle instead of several.
 #
 # The cost is the same either way: a change made less than the interval before a
 # power cut is lost. None of these values is worth a flash sector.
@@ -342,7 +360,9 @@ wifi:
   # coming from the strip. LIGHT maps to WIFI_PS_MIN_MODEM, which sleeps between
   # DTIM beacons and wakes for every one of them.
   #
-  # Measured: 67 C -> 38-41 C, together with the cpu_frequency drop above.
+  # Measured: 67 C -> 38-41 C. That was together with a cpu_frequency of 80MHZ,
+  # which has since gone back to 160MHZ for the reason given up there, so the
+  # figure understates what this line alone is worth today.
   #
   # The trade is one-sided in this device's favour. Only INBOUND traffic is
   # delayed - the access point buffers it until the next beacon, typically 100
@@ -462,6 +482,7 @@ web_server:
   # Reset button, which clears the WiFi credentials. The credentials were
   # already sitting unused in secrets.yaml.
   auth:
+    type: digest
     username: !secret web_username
     password: !secret web_password
 
@@ -1207,6 +1228,7 @@ sensor:
     icon: mdi:brightness-6
     pin: ${PIN_BRIGHTNESS}
     attenuation: 12db
+    entity_category: diagnostic
     accuracy_decimals: 3
     # Sampled once a second and averaged over 8 hardware reads, but only
     # published every fifth - so the traffic is the same 0.2 Hz as before while
@@ -1357,9 +1379,9 @@ number:
     unit_of_measurement: min
     mode: box
     min_value: 1
-    max_value: 60
+    max_value: 10
     step: 1
-    initial_value: 10
+    initial_value: 3
     optimistic: true
     restore_value: true
     entity_category: config
@@ -1381,8 +1403,7 @@ datetime:
     type: TIME
     optimistic: true
     restore_value: true
-    entity_category: config
-    initial_value: "07:00:00"
+    initial_value: "09:00:00"
     on_time:
       - if:
           condition:
@@ -1445,7 +1466,6 @@ switch:
     id: alarm_enabled_id
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
-    entity_category: config
 
   #
   # Kept optimistic on purpose: the state lives in global_enable_seconds, which
@@ -1462,7 +1482,6 @@ switch:
     id: infinity_enable_seconds
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
-    entity_category: config
     turn_on_action:
       then:
         lambda: |-
@@ -1525,9 +1544,10 @@ text:
     initial_value: '#2DFF49'
 
   #
-  # Where the device is, in decimal degrees, north and east positive. The Sun
-  # effect computes the real solar elevation from these, so they decide when the
-  # ring starts to light and how far it opens.
+  # Where the device is, in decimal degrees, north and east positive. The
+  # astronomy interval parses these and computes the real solar and lunar
+  # position from them, so they decide when the Sun effect's ring starts to
+  # light and how far it opens, and where the Moon effect puts its arc.
   #
   # Text rather than number entities because a number would need a fixed step
   # and these want free decimals; and text so they can be corrected from Home
@@ -1590,7 +1610,6 @@ select:
     initial_option: "Normal"
     optimistic: true
     restore_value: true
-    entity_category: config
 
   # The first option is "Off" and NOT "None" on purpose. Home Assistant's MQTT
   # integration treats the literal payload "None" as its PAYLOAD_NONE sentinel,
@@ -1610,12 +1629,13 @@ select:
     initial_option: "Off"
     optimistic: true
     restore_value: true
-    entity_category: config
 
 #
-# The clock face itself. Every animation below is an addressable_lambda rather
-# than an external component or a header in esphome.includes, which keeps the
-# whole device in this one file.
+# The clock face itself. The five animations written for this device - Time,
+# Alarm, Fire, Sun and Moon - are addressable_lambdas rather than an external
+# component or a header in esphome.includes, which keeps the whole device in
+# this one file. Five stock effects follow them; see the note above those for
+# what sets the two groups apart.
 #
 # https://esphome.io/components/light/esp32_rmt_led_strip
 #
@@ -1689,12 +1709,31 @@ light:
               return Color(color.r * factor, color.g * factor, color.b * factor);
             };
 
-            // set the LED to the inverse of the two LEDs next to it, showing as white on the main face
+            // A dial mark: the pixel is set to the inverse of what surrounds
+            // it, so it stays readable whatever the face underneath is doing.
+            //
+            // Inverting per CHANNEL, which this did, does not give that. The
+            // inverse of a saturated colour is its COMPLEMENT, so a red arc got
+            // a cyan mark and a green one magenta - hues that appear nowhere
+            // else on the face and read as a fault rather than as a marking.
+            // The comment here used to claim the result was white on the main
+            // face; that only ever held where the surround was near black.
+            //
+            // Inverting the LUMINANCE keeps the contrast that was the point of
+            // the inversion and drops the hue: a neutral grey, bright over a
+            // dark surround and dark over a bright one, and never a colour the
+            // palette does not contain.
             auto invertLED = [&](int32_t i) {
-              Color averagecolor = linearBlend(it[(i - 1 + it.size()) % it.size()].get(),
+              const Color around = linearBlend(it[(i - 1 + it.size()) % it.size()].get(),
                                                it[(i + 1) % it.size()].get(), 0.5f);
-              averagecolor = Color(255 - averagecolor.r, 255 - averagecolor.g, 255 - averagecolor.b);
-              it[i] = averagecolor;
+
+              // Rec. 601 weights rather than a flat (r+g+b)/3: the eye takes
+              // almost none of its brightness from blue and most of it from
+              // green, so a flat mean calls a saturated blue surround
+              // mid-bright and answers it with a dark mark nobody can see.
+              const float luma = 0.299f * around.r + 0.587f * around.g + 0.114f * around.b;
+              const uint8_t level = (uint8_t) std::max(255.0f - luma, 0.0f);
+              it[i] = Color(level, level, level);
             };
 
             // Reads "#RRGGBB" from a Color * text entity. Parsed per frame on
@@ -1930,12 +1969,14 @@ light:
               }
             };
 
-            // Drawn for every face type, and after the background, so the hands
-            // sit on top of the gradient rather than being blended into it.
-            drawHand(hour_pos, hour_color, fadeOf(hour_changed_ms));
-            drawHand(minute_pos, minute_color, fadeOf(minute_changed_ms));
-
-            // indicator
+            // Dial marks, drawn before the hands so they belong to the FACE:
+            // each one is computed from the background alone, and the hands
+            // then pass over them.
+            //
+            // Between the hands and the seconds, where this used to sit, every
+            // mark was instead computed from whatever the hour and minute
+            // comets had just painted beside it - so a mark shifted as a hand
+            // slid past and settled back once it had gone, once a minute.
             switch (indicator.value_or(INDICATOR_OFF)) {
               default:
                 break;
@@ -1956,6 +1997,12 @@ light:
                 }
                 break;
             }
+
+            // Drawn for every face type, and after the background and the dial
+            // marks, so the hands sit on top of both rather than being blended
+            // into them.
+            drawHand(hour_pos, hour_color, fadeOf(hour_changed_ms));
+            drawHand(minute_pos, minute_color, fadeOf(minute_changed_ms));
 
             if (enable_seconds) {
               drawHand(second, second_color, fadeOf(second_changed_ms));
@@ -2181,8 +2228,9 @@ light:
           name: Sun
           # The sun moves about 0.004 degrees per second. Over ten seconds that
           # is far less than one pixel of arc, so anything faster would only
-          # burn cycles - and this lambda is the one piece of real floating
-          # point trigonometry in the config.
+          # burn cycles. The position itself is not computed here at all - the
+          # astronomy interval does that on its own 10s clock and leaves it in
+          # a global, so this rate only decides how often the arc is redrawn.
           update_interval: 10s
           lambda: |-
             // Position comes from the astronomy interval, so this lambda only
@@ -2258,8 +2306,9 @@ light:
       - addressable_lambda:
           name: Moon
           # The moon moves about half a degree an hour, and the arc changes by
-          # roughly two pixels a day. 10s matches the Sun effect and keeps the
-          # heaviest maths in this config off the hot path.
+          # roughly two pixels a day. 10s matches the Sun effect; like it, the
+          # position and phase are computed by the astronomy interval rather
+          # than here, so this only sets the redraw rate.
           update_interval: 10s
           lambda: |-
             // Position and phase come from the astronomy interval; this lambda
@@ -2331,10 +2380,12 @@ light:
       # it by name, so picking Twinkle by hand means the next reconnect or SNTP
       # sync will quietly replace it with Time.
       #
-      # The ambient-dim block itself is copied into all five lambdas rather than
-      # shared. addressable_lambda has no way to call across effects - sharing
-      # would mean esphome: includes: and a second file, and keeping this device
-      # in one file is worth more than saving four copies of six lines.
+      # The ambient-dim block itself is copied into four of the five lambdas
+      # rather than shared - Alarm is the exception, deliberately, for the
+      # reason given on it. addressable_lambda has no way to call across
+      # effects: sharing would mean esphome: includes: and a second file, and
+      # keeping this device in one file is worth more than saving three copies
+      # of six lines.
       #
       - addressable_rainbow:
           name: Rainbow
