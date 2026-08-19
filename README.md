@@ -105,13 +105,14 @@ All tunables live in `substitutions:` at the top of `infinity.yaml`:
 | `SUN_WHITE_ELEVATION` | solar elevation at which `Sun` reads as plain daylight |
 | `FIRE_COOLING` / `FIRE_SPARKING` | how short and how active the `Fire` flames are |
 | `FIRE_MAX_HEAT` | caps the fire palette short of white — raise towards `255` for white tips |
-| `ALARM_RED` / `ALARM_GREEN` / `ALARM_BLUE` | peak colour of the `Alarm` pulse |
+| `ALARM_RED` / `ALARM_GREEN` / `ALARM_BLUE` | peak colour of the `Alarm` pulse, scaled by its own 0–255 ramp |
 | `GRADIENT_DIM` | how far the `Gradient` face dims its ramps, so the hands still stand out |
+| `FACE_BLEND` | how wide the `Normal` face's two ramps are, `0` = two flat arcs, `1` = both arcs start on the same colour |
 | `NUM_LEDS` | ring size — see the note above, this is not a free parameter |
 | `PIN_LED_RING` / `PIN_BRIGHTNESS` | see the pin table above before changing |
 
 `AMBIENT_DARK` and `AMBIENT_BRIGHT` are in **volts**, matching what the
-`Brightness sensor` entity publishes. Measured on the built device:
+`Brightness` entity publishes. Measured on the built device:
 
 | Condition | Reading |
 | --- | --- |
@@ -149,7 +150,7 @@ The node is deliberately configured to keep running on its own:
 
 - **API** with encryption and `reboot_timeout: 0s` — no reboot when Home Assistant is unreachable.
 - **MQTT** is **off at boot**, with `reboot_timeout: 0s` and `discovery: False`. Everything the device does works without a broker — the clock runs from SNTP and Home Assistant reaches it over the native API — so it comes up in the cheapest state and MQTT is switched on when wanted, from the `MQTT` switch.
-- **WiFi** with `fast_connect`, light power saving (see below), plus a fallback access point and captive portal.
+- **WiFi** with light power saving (see below), plus a fallback access point and captive portal. `fast_connect` is **off**: it skips the scan and takes the first access point that answers, which is right for a hidden SSID and wrong everywhere else — with several APs on one SSID the device would ignore the strongest. Turn it on only if this network is hidden.
 - **Web server** (version 3, assets served locally) on port 80.
 - **Time** via SNTP against `pool.ntp.org`, timezone `Europe/Berlin`.
 
@@ -216,21 +217,27 @@ option list was a hand-maintained copy of the effect names, which is the most
 drift-prone thing a config like this can carry.
 
 **Diagnostics** — ESPHome Version, Firmware Version, Device Uptime, Uptime,
-Reset Reason, Reset Count, Internal Temperature, Sun Elevation, Moon Altitude,
+Reset Reason, Reset Count, Sun Elevation, Moon Altitude,
 Moon Illumination, Moon Phase, SSID, IP Address, DNS Address, Connection Status,
-WiFi Signal (dBm), WiFi Signal (%), Brightness sensor.
+WiFi Signal (dBm), WiFi Signal (%), Brightness.
 
 `Sun Elevation`, `Moon Altitude`, `Moon Illumination` and `Moon Phase` come free: the
 `Sun` and `Moon` effects need those numbers anyway, so exposing them turns the clock
 into a usable source for automations without adding an integration for it. They are
-pushed by the interval that computes them rather than polled, so they can never report
-something the ring is not showing.
+pushed rather than polled, so they can never report something the ring is not showing.
+The push runs on a 60 s interval while the maths behind it runs every 10 s — the ring
+follows the sky at the faster rate, Home Assistant hears about it at the slower one,
+because `publish_state` does not deduplicate and at one decimal the moon's
+illumination changes essentially never.
 
-`Internal Temperature` is the SoC die sensor, not the enclosure. The C3's absolute
-maximum is 125 °C and anything up to ~60 °C under load is unremarkable for a QFN part
-with no heatsink. If the device runs hot, switch the light off and watch this for ten
-minutes: a clear drop means the heat comes from the LED supply path, not the ESP32 —
-see below.
+**There is no `Internal Temperature` entity, deliberately.** On this ESP32-C3 the SoC
+die sensor stops the fallback access point from beaconing, exactly like the ESPHome
+`debug` component does — both were removed for that reason, and `Reset Reason` is read
+from `esp_reset_reason()` directly instead. That trade matters here because a
+configured `ap:` block also disables ESPHome's reboot-on-no-WiFi (`WiFiComponent`
+guards it with `!has_ap()`), so a mute SoftAP would leave no way back in but a serial
+reflash. If you need die temperatures for thermal work, add the sensor back
+temporarily, read it over USB, and take it out again before the clock goes on a wall.
 
 `Reset Reason` and `Reset Count` belong together: the reason comes straight from
 `esp_reset_reason()` and tells you *why* the device last restarted, the count tells
@@ -250,8 +257,13 @@ restarts and is only cleared by a factory reset.
 | `Sun` | the real sun: lights at 12 o'clock as it clears the horizon, opens outwards as it climbs, closes the ring at solar noon, in the sun's own colour |
 | `Alarm` | red pulse, roughly two seconds per cycle |
 
-Plus the ESPHome built-ins: Rainbow, Color Wipe, Scan, Twinkle, Random Twinkle,
-Fireworks and Flicker.
+Plus five ESPHome built-ins: Rainbow, Color Wipe, Fireworks, Twinkle and Random
+Twinkle. Two things separate them from the five lambdas above. They do **not** follow
+the room light — `global_ambient_dim` is applied inside each lambda and a built-in has
+none, so Rainbow at night stays as bright as the brightness setting says. And `Twinkle`
+doubles as the boot indicator: the handover to the clock face tests for it by name, so
+selecting `Twinkle` by hand means the next reconnect or SNTP sync will quietly replace
+it with `Time`.
 
 Each effect declares its own `update_interval`, matched to how fast it can actually
 change — 50 ms for `Time`, 30 ms for `Fire` and `Alarm`, 10 s for `Sun` and `Moon`.
@@ -372,10 +384,19 @@ applying gamma on top crushes the dark end of the hour/minute blend into black.
 
 ### Boot behaviour
 
-The ring briefly runs `Twinkle`, then settles on `Time` at `DEFAULT_BRIGHTNESS` once
-all components are up. Switching the light on from Home Assistant always returns to
-that same state, whatever effect or colour was set before. The ring is turned off on
-shutdown.
+The ring runs `Twinkle` from the moment the LEDs are addressable and stays there until
+two things are true: the radio has associated **and** SNTP has delivered a valid time.
+Then it settles on `Time` at `DEFAULT_BRIGHTNESS`. Both conditions matter — an access
+point without a route to the internet gives no time, and the clock face blanks the ring
+when the clock is invalid, so handing over on association alone would trade a visible
+"waiting" indicator for a black ring.
+
+Switching the light on from Home Assistant always returns to that same state, whatever
+effect or colour was set before.
+
+The ring is **not** darkened on shutdown, and cannot be: WS2811s latch their last frame
+and ESPHome's restart path gives the light no chance to write another one. It keeps
+showing whatever it was showing until the new firmware boots. See *Known limitations*.
 
 ## State that survives a reboot
 
@@ -390,7 +411,7 @@ The three faces:
 
 | Face | What it draws |
 | --- | --- |
-| `Normal` | the two arcs between the hands, each in a flat hand colour |
+| `Normal` | the two arcs between the hands, each ramping from a blend of both hand colours up to its own hand colour — width set by `FACE_BLEND` |
 | `Simple` | the hands as bare dots on a dark ring |
 | `Gradient` | both arcs as colour ramps — hour colour to minute colour one way round, minute back to hour the other |
 
@@ -413,11 +434,25 @@ face.
 
 ## Known limitations
 
-- **The `on_boot` priority 200 block never fires.** All `on_boot` triggers run during
-  `setup()`, milliseconds apart — the priorities order them, they do not spread them
-  over time — so WiFi has not associated yet and the condition is always false. A real
-  "waiting for network" indicator needs a `wifi:` `on_connect` / `on_disconnect`
-  trigger. The block is kept, commented, to document the trap.
+- **The ring cannot be darkened on shutdown.** `Application::reboot()` calls
+  `on_shutdown()` on every component and then restarts immediately, while the strip is
+  only ever written from `LightState::loop()` — and neither `light_state` nor
+  `esp32_rmt_led_strip` implements `on_shutdown` or `teardown`, so that loop never runs
+  again. A `light.turn_off` there sets `next_write_` and nothing consumes it. WS2811s
+  latch, so the last frame stays lit through the restart. The config used to carry such
+  a block; it was removed rather than left looking as if it worked.
+- **No die temperature.** `internal_temperature` and the ESPHome `debug` component both
+  stop the fallback access point from beaconing on this ESP32-C3. Since a configured
+  `ap:` block also disables ESPHome's reboot-on-no-WiFi, a mute SoftAP would leave no
+  way back in short of a serial reflash. Add the sensor back only for a measurement
+  session over USB.
+- **The built-in effects ignore the light sensor.** Ambient dimming lives inside each
+  `addressable_lambda`; Rainbow, Color Wipe, Fireworks, Twinkle and Random Twinkle have
+  no lambda to put it in and stay at the set brightness all night.
+- **`Alarm` only stands itself down if it is still showing.** Silencing it by picking
+  another effect, or by switching the ring off, leaves the timer to expire quietly —
+  which is the point, but it also means an `Alarm` selected by hand from the effect
+  list never ends on its own.
 
 ## License
 
@@ -433,8 +468,12 @@ recalculated per effect:
   for sidereal time — and the four sky diagnostics need both. Three copies of the same
   trigonometry would be three chances to fix a bug in only two of them. The effect
   lambdas read globals and draw; no double-precision astronomy sits on a render path.
+  A second `interval: 60s` pushes the four sky sensors — the ring follows the sky at
+  10 s, Home Assistant hears about it at 60 s, because `publish_state` does not
+  deduplicate and republishing an unchanged moon phase six times a minute is traffic
+  for nothing.
 - **`global_ambient_dim`** holds the volts-to-brightness mapping, computed on the
-  `Brightness sensor`. `Time`, `Fire`, `Sun` and `Moon` each scale their finished frame
+  `Brightness` sensor. `Time`, `Fire`, `Sun` and `Moon` each scale their finished frame
   by it. `Alarm` deliberately does not — an alarm that turns itself down in a dark room
   fails at the one moment it is needed.
 
@@ -444,15 +483,21 @@ full year, so one set of elements now serves both bodies.
 
 ### Boot and network
 
-`on_boot` lights `Twinkle`, and nothing switches to the clock face until WiFi
-`on_connect` fires — so the busy indicator is real. It used to be a boot trigger at
-priority 200 testing `wifi.connected`, which could never be true: every `on_boot`
-trigger runs inside `setup()`, milliseconds apart, long before the radio associates.
+`on_boot` lights `Twinkle`, and nothing switches to the clock face until the
+`show_clock` script says so — so the busy indicator is real. It used to be a boot
+trigger at priority 200 testing `wifi.connected`, which could never be true: every
+`on_boot` trigger runs inside `setup()`, milliseconds apart, long before the radio
+associates.
 
-There is deliberately no `on_disconnect` counterpart, and `on_connect` only acts if the
-ring is still on `Twinkle`. The clock runs off the system clock, not off the network,
-so losing WiFi is no reason to stop showing the time — and a reconnect should not undo
-whatever was selected in Home Assistant.
+`show_clock` is called from two places that each know only half of what is needed —
+`wifi:` `on_connect` knows the radio associated, `time:` `on_time_sync` knows there is
+a time — so both guards live in one script instead of being half-checked twice. It acts
+only if the ring is still on `Twinkle` **and** the clock is valid.
+
+There is deliberately no `on_disconnect` counterpart. The clock runs off the system
+clock, not off the network, so losing WiFi is no reason to stop showing the time — and
+a reconnect should not undo whatever was selected in Home Assistant, which is what the
+`Twinkle` guard prevents.
 
 The `MQTT` switch reports what was *asked for*, not what the network is doing — the
 only getter available is `is_connected()`, so mirroring the real state would make the

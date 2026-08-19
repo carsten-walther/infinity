@@ -11,7 +11,7 @@ substitutions:
   author_name: carsten-walther
   friendly_name: Infinity
   comment: Just another analogue clock
-  version: 2026.8.16
+  version: 2026.8.19
   area: Miscellaneous
 
   #
@@ -50,6 +50,18 @@ substitutions:
   GRADIENT_DIM: "0.35"
 
   #
+  # How wide the "Normal" face's two ramps are, as a fraction 0..1.
+  #
+  # Each arc starts at its own hand's colour pulled this far towards the other
+  # hand's colour, and ends on the full colour at the far end. 0 gives two flat
+  # arcs meeting at the hands, 1 makes both arcs start on the same colour and
+  # the two hands become the only thing telling them apart.
+  #
+  # Needs a decimal point: the lambda appends "f" to build a float literal.
+  #
+  FACE_BLEND: "0.5"
+
+  #
   # Brightness the clock comes back to on boot and on every switch-on. 60 LEDs
   # at full white draw around 3.6 A - the ring runs on its own supply here, so
   # that is a question for the power brick rather than for the board, but it is
@@ -62,10 +74,9 @@ substitutions:
   #
   # The colour the ring carries underneath the effects. Every effect here writes
   # its pixels directly and ignores it, so it is only visible in one situation:
-  # no effect running with the light on, which is reachable from the LED color
-  # entity's own effect list. The Effect select cannot get there - its "Off"
-  # entry switches the ring off instead. It is also what the light fades through
-  # when an effect starts.
+  # no effect running with the light on, which is reached by picking "None" from
+  # the LED color entity's own effect list. It is also what the light fades
+  # through when an effect starts.
   #
   # Warm white rather than flat 100/100/100. Note that gamma_correct is 1.0 on
   # this light, so these percentages go to the LEDs linearly and not corrected
@@ -184,6 +195,13 @@ substitutions:
   # Peak colour of the pulse, 0-255 per channel. The last effect that still had
   # its colour hard-coded.
   #
+  # The effect scales these by its own 0-255 ramp and divides by 255, so any
+  # value in range behaves. It did NOT before: the multiplication ran in int and
+  # went straight into Color(uint8_t, uint8_t, uint8_t), so 255 * level
+  # overflowed and came out as 256 - level - the ring DIMMED as the ramp climbed
+  # and snapped from black to 97% at the bottom of every cycle. A peak of 200
+  # degenerated into a four-frame sawtooth, a strobe rather than a pulse.
+  #
   ALARM_RED: "255"
   ALARM_GREEN: "0"
   ALARM_BLUE: "0"
@@ -231,18 +249,31 @@ esphome:
 
     - priority: -100
       then:
-        # Both are pushed rather than polled: the version string is a compile-time
-        # constant and the reset count changes once per boot, so an interval could
+        # All three are pushed rather than polled: the version string is a
+        # compile-time constant, the reset count changes once per boot and the
+        # reset reason cannot change while the device is up, so an interval could
         # only republish an unchanged value - publish_state does not deduplicate.
         - component.update: firmware_version_id
         - component.update: reset_count_sensor_id
+        - component.update: reset_reason_id
 
-  # priority 700 runs early enough that the light is still controllable
-  on_shutdown:
-    priority: 700
-    then:
-      - light.turn_off:
-          id: led_ring_id
+  # There is deliberately no on_shutdown block parking the ring.
+  #
+  # It used to hold `light.turn_off: led_ring_id` at priority 700, which reads
+  # as if it darkened the ring before a restart. It never did. Application::
+  # reboot() calls on_shutdown() on every component and then arch_restart()
+  # straight after, while the only place the strip is actually written is
+  # LightState::loop() - and neither light_state nor esp32_rmt_led_strip
+  # implements on_shutdown or teardown, so that loop never runs again. The call
+  # set next_write_ and nothing ever consumed it.
+  #
+  # default_transition_length below makes it doubly moot: a turn_off with no
+  # explicit length takes the transition branch, so even with a loop it would
+  # only have STARTED a 1s fade that the restart cuts off mid-way.
+  #
+  # WS2811s latch their last frame, so the ring keeps showing whatever it showed
+  # right through the restart either way. Better an honest gap than a line that
+  # looks like it handles this.
 
 #
 # https://esphome.io/components/esp32
@@ -271,6 +302,21 @@ esp32:
     type: esp-idf
 
 #
+# Eight things persist here - the three hand colours, the two coordinates, the
+# alarm time and duration, both selects, the seconds switch and the reset count
+# - and every one of them lands in the same flash sector. The default buffers
+# writes for 60s; 5min buffers a burst of slider-dragging in Home Assistant into
+# a single erase cycle instead of several.
+#
+# The cost is the same either way: a change made less than the interval before a
+# power cut is lost. None of these values is worth a flash sector.
+#
+# https://esphome.io/components/esphome#preferences
+#
+preferences:
+  flash_write_interval: 5min
+
+#
 # https://esphome.io/components/wifi
 #
 wifi:
@@ -278,7 +324,17 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   domain: .local
-  fast_connect: True
+
+  # False, not the True this had. fast_connect skips the scan and associates
+  # with the first AP that answers for the SSID, which is what you want for a
+  # hidden network and a liability on any other: with more than one access point
+  # on the same SSID the device sticks to whoever replies first rather than to
+  # the strongest. At the -63 to -65 dBm this node sees, picking the better BSSID
+  # is worth the second or two the scan costs once per boot.
+  #
+  # Put it back to True if this SSID is hidden - fast_connect is the only way to
+  # associate with one.
+  fast_connect: False
 
   # LIGHT, not the NONE this started with: NONE keeps the radio powered up
   # permanently, which was the single largest heat source on this board - the
@@ -302,26 +358,17 @@ wifi:
 
   enable_on_boot: True
 
-  # Leaves the boot indicator and shows the clock, once - and only if the ring
-  # is still on Twinkle. Guarding on that matters: on_connect fires again after
-  # every reconnect, and a clock that jumps back to the time face because the
-  # access point hiccupped would undo whatever was selected in Home Assistant.
+  # Leaves the boot indicator and shows the clock - see the show_clock script for
+  # the two conditions that have to hold. Associating is only half of it: an
+  # access point without a route to the internet gives no SNTP, and switching to
+  # the clock face then would blank the ring, so the script waits for a valid
+  # time as well and time: on_time_sync drives the other half.
   #
   # There is deliberately no on_disconnect counterpart. The clock runs off the
   # system clock, not off the network, so losing WiFi is no reason to stop
   # showing the time.
   on_connect:
-    - if:
-        condition:
-          lambda: return id(led_ring_id).get_effect_name().str() == "Twinkle";
-        then:
-          - light.turn_on:
-              id: led_ring_id
-              brightness: ${DEFAULT_BRIGHTNESS}
-              red: ${IDLE_RED}
-              green: ${IDLE_GREEN}
-              blue: ${IDLE_BLUE}
-              effect: Time
+    - script.execute: show_clock
 
   # Reduced from the ~20 dBm default. Barely moves the power budget - this node
   # transmits well under 0.1% of the time - but it does no harm either. Do not
@@ -444,6 +491,18 @@ time:
       - 1.pool.ntp.org
       - 2.pool.ntp.org
 
+    # The second half of the boot handover, with wifi: on_connect being the
+    # first. Associating with an access point that has no route to the internet
+    # satisfies on_connect but never produces a time, and the Time effect blanks
+    # the ring when the clock is invalid - so the device would sit there dark
+    # with one ERROR line and nothing to look at. Twinkle stays up until a sync
+    # actually lands.
+    #
+    # Fires on every sync, not only the first; the script's own guard makes the
+    # repeats harmless.
+    on_time_sync:
+      - script.execute: show_clock
+
 #
 # https://esphome.io/components/logger
 #
@@ -453,13 +512,29 @@ logger:
   level: ERROR
 
 #
-# Provides the reset_reason text sensor further down. Nothing else from this
-# component is enabled - the heap and loop-time sensors it can expose poll
-# continuously, and this device has no memory problem to watch.
+# The ESPHome `debug` component is deliberately NOT used here, and neither is
+# `internal_temperature`. On this ESP32-C3 under ESP-IDF 5.5.5 either one on its
+# own stops the SoftAP from beaconing: the fallback access point disappears
+# entirely while the rest of the firmware keeps running normally. Found by
+# bisecting a minimal config on the sibling odb2-sniffer board - adding `debug:`
+# alone reproduces it, removing it restores the AP - and the on-chip temperature
+# sensor shares hardware with the RF subsystem, which is the likely mechanism
+# for both.
 #
-# https://esphome.io/components/debug
+# That matters more here than anywhere else in the fleet, because `ap:` is
+# configured. WiFiComponent::loop() guards its reboot-on-no-connection with
+# `!this->has_ap()`, and has_ap_ is set at config time, not when the AP comes
+# up - so with an `ap:` block present the reboot timeout never fires. Lose the
+# credentials with a mute SoftAP and there is no fallback AP AND no reboot to
+# retry with: the way back in is a serial reflash.
 #
-debug:
+# The reset reason it provided is read from esp_reset_reason() directly further
+# down instead - same value, no component in the RF path.
+#
+# If a die temperature is ever wanted back, take it from a source that does not
+# touch the radio. The 67 C -> 38-41 C figure quoted on power_save_mode above
+# was measured with this sensor before it was removed.
+#
 
 #
 # https://esphome.io/components/globals
@@ -713,6 +788,21 @@ interval:
 
           id(global_moon_altitude) = (float) moonAlt;
 
+  #
+  # The four sky sensors publish on their own, slower clock.
+  #
+  # They used to be pushed from the 10s block above, which meant 4 x 6 = 24
+  # publishes a minute over the api and, when it is on, mqtt: about 34,500 a
+  # day. publish_state does not deduplicate - the same reason Firmware Version
+  # stopped being polled - and most of those carried an unchanged value. At one
+  # decimal the moon's altitude changes roughly every twelve minutes and its
+  # illumination essentially never.
+  #
+  # The RING still follows the sky at 10s: the effects read the globals, not
+  # these entities. This only sets how often Home Assistant hears about it.
+  #
+  - interval: 60s
+    then:
       - component.update: sun_elevation_id
       - component.update: moon_altitude_id
       - component.update: moon_illumination_id
@@ -726,19 +816,41 @@ text_sensor:
 
   #
   # Reset Reason
-  # https://esphome.io/components/text_sensor/debug
   #
   # Cause of the last restart, straight from esp_reset_reason(). Read it
   # together with Reset Count and Device Uptime: the reason alone cannot tell
   # you that a restart happened while nobody was looking, and a rising count at
   # a low uptime is the signature of a device rebooting in a loop.
   #
-  - platform: debug
-    reset_reason:
-      id: reset_reason_id
-      name: Reset Reason
-      icon: mdi:restart-alert
-      entity_category: diagnostic
+  # Read directly rather than through the ESPHome `debug` component, which kills
+  # the SoftAP on this chip - see the note where that component used to be.
+  #
+  # update_interval: never, like Firmware Version: the reason cannot change
+  # while the device is up, so polling it could only republish an identical
+  # string forever. Pushed once from the late on_boot block.
+  #
+  - platform: template
+    id: reset_reason_id
+    name: Reset Reason
+    icon: mdi:restart-alert
+    entity_category: diagnostic
+    update_interval: never
+    lambda: |-
+      switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:   return {"Power on"};
+        case ESP_RST_EXT:       return {"External reset"};
+        case ESP_RST_SW:        return {"Software reset"};
+        case ESP_RST_PANIC:     return {"Panic / exception"};
+        case ESP_RST_INT_WDT:   return {"Interrupt watchdog"};
+        case ESP_RST_TASK_WDT:  return {"Task watchdog"};
+        case ESP_RST_WDT:       return {"Other watchdog"};
+        case ESP_RST_DEEPSLEEP: return {"Deep sleep wake"};
+        case ESP_RST_BROWNOUT:  return {"Brownout"};
+        case ESP_RST_SDIO:      return {"SDIO reset"};
+        case ESP_RST_USB:       return {"USB peripheral"};
+        case ESP_RST_JTAG:      return {"JTAG"};
+        default:                return {"Unknown"};
+      }
 
   #
   # ESPHome Version
@@ -747,6 +859,7 @@ text_sensor:
   - platform: version
     name: ESPHome Version
     icon: mdi:new-box
+    entity_category: diagnostic
 
   #
   # Firmware Version
@@ -755,6 +868,7 @@ text_sensor:
     id: firmware_version_id
     name: Firmware Version
     icon: mdi:new-box
+    entity_category: diagnostic
     # A compile-time constant. Polling it re-sent the same string to the api and
     # mqtt every 60s for the lifetime of the device; publish_state does not
     # deduplicate, so nothing upstream was filtering that out. Published once
@@ -868,6 +982,7 @@ binary_sensor:
   - platform: status
     name: Connection Status
     icon: mdi:connection
+    entity_category: diagnostic
 
 #
 # https://esphome.io/components/button
@@ -920,17 +1035,6 @@ sensor:
     entity_category: diagnostic
     device_class: ""
 
-  #
-  # Internal Temperature
-  #
-  # The SoC's own die sensor, not the enclosure. Added to turn "the chip feels
-  # hot" into a number that can be compared before and after a change - the
-  # C3's absolute maximum is 125 C, and anything up to ~60 C under load is
-  # unremarkable for a QFN part with no heatsink.
-  #
-  # Read it against what the ring is doing: switch the light off from Home
-  # Assistant and watch for ten minutes. If the temperature barely moves, the
-  # heat is not coming from the ESP32 at all but from the LED supply path.
   #
   # Coordinates from Home Assistant
   #
@@ -1041,14 +1145,15 @@ sensor:
       return id(global_moon_illuminated) * 100.0f;
 
   #
-  # https://esphome.io/components/sensor/internal_temperature
+  # Internal Temperature is deliberately removed. The SoC die sensor kills the
+  # SoftAP on this ESP32-C3 the same way the debug component does - see the note
+  # where that component used to be. It was worth having while the thermal work
+  # was going on (it is where the 67 C -> 38-41 C figure comes from), and it is
+  # not worth a silently dead fallback access point afterwards.
   #
-  - platform: internal_temperature
-    id: internal_temperature_id
-    name: Internal Temperature
-    icon: mdi:thermometer
-    entity_category: diagnostic
-    update_interval: 60s
+  # To measure again: put `- platform: internal_temperature` back temporarily,
+  # take the readings over USB, then remove it before the clock goes on a wall.
+  #
 
   #
   # https://esphome.io/components/sensor/wifi_signal
@@ -1098,7 +1203,7 @@ sensor:
   #
   - platform: adc
     id: brightness_sensor
-    name: Brightness sensor
+    name: Brightness
     icon: mdi:brightness-6
     pin: ${PIN_BRIGHTNESS}
     attenuation: 12db
@@ -1153,10 +1258,51 @@ sensor:
 #
 # https://esphome.io/components/script
 #
-# mode: restart, so an alarm that fires while a previous one is still running
-# starts its timer over instead of queueing a second stand-down.
-#
 script:
+
+  #
+  # The boot handover: leave the Twinkle indicator and show the clock face.
+  #
+  # Called from two places that each know only half of what is needed - wifi:
+  # on_connect knows the radio associated, time: on_time_sync knows there is a
+  # time - so the conditions live here once instead of being half-checked twice.
+  #
+  # Both guards earn their place:
+  #
+  #   Twinkle   on_connect fires again after every reconnect and on_time_sync
+  #             every time SNTP re-syncs. Without this, a clock that jumped back
+  #             to the time face because the access point hiccupped would undo
+  #             whatever was selected in Home Assistant.
+  #
+  #   is_valid  the Time effect blanks the ring when the clock is invalid. An
+  #             access point with no route to the internet satisfies on_connect
+  #             but yields no SNTP, and switching over then would trade a
+  #             visible "waiting" indicator for a black ring.
+  #
+  # mode: single - two callers can race on the first successful boot, and the
+  # second run would only re-evaluate a guard that no longer holds.
+  #
+  - id: show_clock
+    mode: single
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: return id(led_ring_id).get_effect_name().str() == "Twinkle";
+              - lambda: return id(sntp_time).now().is_valid();
+          then:
+            - light.turn_on:
+                id: led_ring_id
+                brightness: ${DEFAULT_BRIGHTNESS}
+                red: ${IDLE_RED}
+                green: ${IDLE_GREEN}
+                blue: ${IDLE_BLUE}
+                effect: Time
+
+  #
+  # mode: restart, so an alarm that fires while a previous one is still running
+  # starts its timer over instead of queueing a second stand-down.
+  #
   - id: alarm_script
     mode: restart
     then:
@@ -1316,6 +1462,7 @@ switch:
     id: infinity_enable_seconds
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
     turn_on_action:
       then:
         lambda: |-
@@ -1443,6 +1590,7 @@ select:
     initial_option: "Normal"
     optimistic: true
     restore_value: true
+    entity_category: config
 
   # The first option is "Off" and NOT "None" on purpose. Home Assistant's MQTT
   # integration treats the literal payload "None" as its PAYLOAD_NONE sentinel,
@@ -1462,6 +1610,7 @@ select:
     initial_option: "Off"
     optimistic: true
     restore_value: true
+    entity_category: config
 
 #
 # The clock face itself. Every animation below is an addressable_lambda rather
@@ -1567,8 +1716,6 @@ light:
 
             auto time = id(sntp_time).now();
 
-            const float blendPoint = 0.5;
-
             int hour = time.hour;
             int minute = time.minute;
             int second = time.second;
@@ -1638,10 +1785,19 @@ light:
               c2 = Color(minute_color.r, minute_color.g, minute_color.b);
             }
 
-            // The blending is the colour that the hour/minute colour will meet.
-            // The greater the blend, the closer to the actual hour/minute colour it gets.
-            c2blend = linearBlend(c2, c1, (float) blendPoint / 255);
-            c1blend = linearBlend(c1, c2, (float) blendPoint / 255);
+            // Each arc runs from its blend colour at the hand it starts on to
+            // the full hand colour at the far end. FACE_BLEND is how far towards
+            // the OTHER hand's colour that starting point is pulled, so a bigger
+            // value is a wider, more obvious ramp and 0 is two flat arcs.
+            //
+            // This used to read `(float) blendPoint / 255` with blendPoint set
+            // to 0.5 - a blend factor of 0.00196. With the default palette that
+            // put each arc between (209,0,182) and (210,0,182): one step of one
+            // channel over thirty pixels. The face rendered as two solid arcs
+            // and the comment here promised a gradient that was never drawn. The
+            // /255 is the leftover; blendPoint was clearly once an int 0-255.
+            c2blend = linearBlend(c2, c1, ${FACE_BLEND}f);
+            c1blend = linearBlend(c1, c2, ${FACE_BLEND}f);
 
             // "Simple" shows the hands as bare dots, so there is no gradient to
             // build. The ring has to be cleared explicitly: the frame buffer is
@@ -1853,7 +2009,13 @@ light:
             // Deliberately NOT dimmed by global_ambient_dim, unlike every
             // other effect here: an alarm that turns itself down in a dark room
             // is an alarm that fails at the one time it is needed.
-            const Color color = Color(${ALARM_RED} * level, ${ALARM_GREEN} * level, ${ALARM_BLUE} * level);
+            // The / 255 is load-bearing, not decoration. level is an int and so
+            // are the substitutions: ${ALARM_RED} * level reaches 65025, and
+            // Color takes uint8_t, so the value that actually reached the LED
+            // was (255 * level) & 0xFF == 256 - level. The pulse ran backwards.
+            const Color color = Color(${ALARM_RED} * level / 255,
+                                      ${ALARM_GREEN} * level / 255,
+                                      ${ALARM_BLUE} * level / 255);
             for (int i = 0; i < it.size(); i++) {
               it[i] = color;
             }
@@ -2155,6 +2317,25 @@ light:
               }
             }
 
+      #
+      # The stock decorative effects. Two things set them apart from the five
+      # lambdas above, and neither was written down before:
+      #
+      # They do NOT follow the room light. global_ambient_dim is applied inside
+      # each lambda, and these are built-ins with no lambda to apply it in - so
+      # Rainbow at night stays as bright as the light's own brightness setting
+      # says. Turn the brightness down by hand, or pick a face that dims itself.
+      #
+      # Twinkle carries a second job: it is the boot indicator. on_boot selects
+      # it and the show_clock script hands over to the clock face by testing for
+      # it by name, so picking Twinkle by hand means the next reconnect or SNTP
+      # sync will quietly replace it with Time.
+      #
+      # The ambient-dim block itself is copied into all five lambdas rather than
+      # shared. addressable_lambda has no way to call across effects - sharing
+      # would mean esphome: includes: and a second file, and keeping this device
+      # in one file is worth more than saving four copies of six lines.
+      #
       - addressable_rainbow:
           name: Rainbow
           speed: 10
