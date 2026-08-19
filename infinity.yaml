@@ -131,8 +131,14 @@ substitutions:
   # second stepping from 10 to 11 reads as movement rather than as two separate
   # states.
   #
-  # FADE_MS is how long that step takes. It has to stay well under 1000, or the
-  # second hand would still be moving when the next second arrives.
+  # FADE_MS is how long that step takes. 999 fills the whole second, so the
+  # second hand is in permanent motion and sweeps rather than ticks - the fade
+  # reaches its target pixel one millisecond before the next second moves it
+  # on. Drop it towards 200 for a hand that visibly arrives and sits still.
+  #
+  # 1000 is a hard ceiling, not a style choice: fadeOf() divides an age that
+  # resets every second by this, so anything above it means the fade never
+  # reaches 1.0 and the second hand trails its true pixel permanently.
   #
   # TAIL is the length of the trail in pixels. Needs a decimal point: the lambda
   # appends "f" to build a float literal.
@@ -1677,9 +1683,9 @@ light:
           # can be.
           #
           # Smoothness: the hands now fade between pixels over HAND_FADE_MS, and
-          # the render period is the step size of that fade. At 400ms fade this
-          # gives eight steps; at the old 500ms it would have given one, which
-          # is not a fade at all.
+          # the render period is the step size of that fade. At the 999ms fade
+          # set above this gives twenty steps; at the old 500ms render period
+          # it would have given two, which is not a fade at all.
           #
           # Still nowhere near the 0ms default, which re-rendered on every
           # main-loop pass. At 20 Hz this lambda costs a fraction of a percent

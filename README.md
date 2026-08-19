@@ -124,7 +124,7 @@ The shipped values (`0.10` / `1.20`) are deliberately **not** those extremes. An
 divider is heavily non-linear and most of its swing sits above anything a living room
 reaches — mapping the full 0.09–2.96 V span would leave the clock at ~40 % brightness
 in a normally lit room. With the indoor window instead, a dark room gives the
-`MIN_FACE_BRIGHTNESS` floor of 15 %, normal room light ~79 %, and anything from
+`MIN_FACE_BRIGHTNESS` floor of 10 %, normal room light ~78 %, and anything from
 1.20 V up clamps to full. Widen `AMBIENT_BRIGHT` if the clock stays too bright in the
 evening.
 
@@ -289,21 +289,25 @@ main-loop pass.
 
 `Time` runs at 50 ms, down from 500 ms originally, for two reasons. The render period
 is exactly how late a hand can be — the display only moves on the first frame after the
-clock changes. And it is the step size of the hand fade below: at a 400 ms fade, 50 ms
-gives eight steps, where the old 500 ms would have given one.
+clock changes. And it is the step size of the hand fade below: at the 999 ms fade
+shipped here, 50 ms gives twenty steps, where the old 500 ms render period would have
+given two.
 
 ### Hand movement
 
 Hands do not snap. Each one is drawn as a short comet sliding from its previous pixel
 to the current one over `HAND_FADE_MS`: the new pixel fades in, the old fades out, and
 a tail of dimming pixels follows behind. A second stepping from 10 to 11 looks like
-this, at 400 ms fade:
+this, at the shipped 999 ms fade:
 
 | t | pixel 8 | 9 | 10 | 11 |
 | --- | --- | --- | --- | --- |
 | 0 ms | 0.33 | 0.67 | 1.00 | 0.00 |
-| 200 ms | 0.17 | 0.50 | 0.83 | 0.50 |
-| 400 ms | 0.00 | 0.33 | 0.67 | 1.00 |
+| 500 ms | 0.17 | 0.50 | 0.83 | 0.50 |
+| 999 ms | 0.00 | 0.33 | 0.67 | 1.00 |
+
+The levels depend only on how far through the fade you are, not on `HAND_FADE_MS`
+itself — shortening it compresses the same three rows into less time.
 
 The trail is drawn *blended into* whatever is already on the ring rather than
 overwriting it: on `Simple` the background is black, so it reads as a pure comet; on
@@ -313,8 +317,15 @@ Note that `HAND_TAIL` leaves a trail at rest as well as during the step — at `
 stationary hand still has two dimmer pixels behind it. Set it to `1.0` for a pure
 crossfade with no trail between steps.
 
-`HAND_FADE_MS` has to stay well under 1000, or the second hand would still be moving
-when the next second arrives.
+At the shipped `HAND_FADE_MS` of 999 the second hand is never at rest: the fade fills
+the whole second and reaches its pixel a millisecond before the next second moves it
+on, so it sweeps rather than ticks. That is the point of the value. Drop it towards
+200 for a hand that visibly arrives and sits still, which also makes the trail note
+above apply to the second hand as well as to the other two.
+
+**1000 is a hard ceiling.** The fade divides an age that resets every second by
+`HAND_FADE_MS`, so anything above 1000 never reaches full and leaves the second hand
+trailing its true pixel permanently.
 
 `Sun` simulates the sun in real time. It computes the solar elevation for the
 device's own coordinates and shows it directly: dark below the horizon, one pixel at
