@@ -218,6 +218,7 @@ default clock, higher receive current — and no working die sensor to measure i
 | `Color hour` / `Color minute` / `Color second` | Text | hex colour, e.g. `#FF0000` |
 | `Latitude` / `Longitude` | Text | decimal degrees, north and east positive — drives the `Sun` and `Moon` effects |
 | `Alarm Time` | Datetime | daily alarm, switches the ring to the `Alarm` effect |
+| `Set Clock` | Datetime | sets the clock by hand when nothing else can — see below |
 | `Alarm Enabled` | Switch | arms `Alarm Time` without losing the setting |
 | `Alarm Duration` | Number | minutes the alarm pulses before standing down, 1–10 |
 | `MQTT` | Switch | brings the broker connection up or down — off after every boot |
@@ -630,6 +631,41 @@ Priority 800 sits between the i²c bus (a `BUS`-priority component at 1000, so a
 up) and the DS1307's own `setup()` at `DATA` (600, so not yet run) — which is fine,
 because the action needs only the bus pointer and the address, and both are assigned
 before `App.setup()` is entered.
+
+#### Setting the clock by hand
+
+Every automatic path needs something the device may not have: SNTP needs a route to the
+internet, the RTC needs to have been set once already, and Home Assistant needs the
+API. With none of the three the ring sits on `Twinkle` indefinitely — the boot handover
+is honest about not knowing the time, which is right, but on its own it left no way to
+*tell* it.
+
+`Set Clock` is that way, and it needs no more than the LAN: `web_server:` runs on port
+80 with digest auth, so the entity is reachable from a browser with no Home Assistant,
+no broker and no route out. Setting it validates the value, sets the system clock,
+copies it into the DS1307, and calls `show_clock` so the ring leaves the boot indicator
+immediately. Because the write reaches the RTC, the setting also survives the next
+power cut — and it clears the `CH` bit, so **setting the time by hand is what
+commissions a factory-fresh module** that has never seen SNTP.
+
+Nothing is pinned by this: the next SNTP sync overwrites both the system clock and the
+RTC, as it should. Network time wins when there is any.
+
+Two details are deliberate and easy to get wrong:
+
+- **`set_action`, not `on_value`.** `publish_state()` calls `state_callback_`, and
+  `setup()` publishes — so an `on_value` automation fires once on *every* boot and would
+  slam the clock back to whatever was stored or compiled in, undoing the RTC read at
+  priority 800. `set_trigger_` is reached only from `control()`, i.e. only when someone
+  actually sets the entity.
+- **No `initial_value`, and `restore_value` left at its default of `false`.** With
+  neither, `publish_state()` sees `year == 0` and reports no state at all, so the field
+  reads empty until it is used. A setter that came back after a reboot showing the
+  moment it was last used would look like a clock and be wrong by exactly the downtime.
+
+This is one `DATETIME` entity rather than the six `number` helpers
+`dew-point-ventilation` uses for the same job — those exist because that device drives
+them from an encoder menu on an LCD, and a web form wants one field, not six.
 
 #### Why the module runs on 3V3, not 5V
 

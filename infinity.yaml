@@ -1581,6 +1581,82 @@ datetime:
           then:
             - script.execute: alarm_script
 
+  #
+  # Setting the clock by hand, for a device with no clock source at all.
+  #
+  # The three automatic paths each need something this device may not have:
+  # SNTP needs a route to the internet, the RTC needs to have been set once
+  # already, and Home Assistant needs the api. With none of them the ring sits
+  # on Twinkle forever - the boot handover is honest about not knowing the
+  # time, which is right, but it left no way to TELL it.
+  #
+  # This is that way, and it needs no network beyond the LAN: web_server: is on
+  # port 80 with digest auth, so the entity is reachable from a browser with
+  # neither Home Assistant nor a broker nor a route out. That is also why it is
+  # one DATETIME rather than the six number helpers dew-point-ventilation uses
+  # for the same job - those exist because that device drives them from an
+  # encoder menu on an LCD, and a web form wants one field, not six.
+  #
+  # set_action, NOT on_value. publish_state() calls state_callback_ (see
+  # datetime_entity.cpp), and setup() publishes - so an on_value automation
+  # fires once on every boot and would slam the clock back to whatever was
+  # stored or compiled in, undoing the RTC read at priority 800. set_trigger_
+  # is reached only from control(), which is to say only when somebody
+  # actually sets the entity.
+  #
+  # No initial_value, and restore_value stays at its schema default of false:
+  # with neither, publish_state() sees year == 0 and reports no state at all.
+  # The field reads empty until it is used, which is the truth - a setter that
+  # came back after a reboot showing the moment it was last used would look
+  # like a clock, and be wrong by exactly the downtime.
+  #
+  - platform: template
+    id: set_clock_id
+    name: Set Clock
+    icon: mdi:clock-edit-outline
+    type: DATETIME
+    optimistic: true
+    entity_category: config
+    set_action:
+      - lambda: |-
+          // x carries only the fields the call set, zero-initialised and with
+          // no timestamp - DateTimeCall does not run recalc for us. Fill in
+          // what a local wall time cannot know and let the tz do the rest.
+          ESPTime t = x;
+          t.day_of_week = 0;
+          t.day_of_year = 0;
+          t.is_dst = false;
+
+          // is_valid rather than fields_in_range, so a plausible-looking
+          // typo from before 2019 is refused here instead of being accepted
+          // and then blanking the ring: the Time effect uses the same test.
+          if (!t.is_valid(false, false)) {
+            ESP_LOGE("set_clock", "Refusing to set an implausible date/time");
+            return;
+          }
+
+          // The entity holds LOCAL time; this folds in the timezone and DST.
+          t.recalc_timestamp_local();
+          if (t.timestamp == -1) {
+            ESP_LOGE("set_clock", "Could not convert local time to epoch");
+            return;
+          }
+
+          struct timeval tv = {};
+          tv.tv_sec = t.timestamp;
+          settimeofday(&tv, nullptr);
+
+          // System clock first, then let the RTC copy it - write_time() reads
+          // the system clock, so the order is load-bearing. This also clears
+          // the DS1307's clock-halt bit, so setting the time by hand is what
+          // commissions a factory-fresh module that has never seen SNTP.
+          id(ds1307_time).write_time();
+
+      # The clock is valid now, so the boot indicator has nothing left to wait
+      # for. The script's own guards make this a no-op if the ring has since
+      # been given something else to show.
+      - script.execute: show_clock
+
 #
 # https://esphome.io/components/switch/template
 #
