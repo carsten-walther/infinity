@@ -17,18 +17,33 @@ substitutions:
   #
   # GPIOs
   #
+  # The i2c bus to the DS1307. GPIO6 and GPIO7 are free pins on this board:
+  # not strapping (that is GPIO2, GPIO8 and GPIO9 on the C3), not ADC, and
+  # not flash - the MINI-1 module carries its flash in-package on GPIO11-17,
+  # which is what leaves 6, 7 and 10 with no second job.
+  #
+  # That matters more for i2c than for anything else here. An idle i2c line
+  # sits HIGH on its pull-ups, but the pull-ups belong to the RTC module: a
+  # bus held low by an unpowered or miswired module is indistinguishable
+  # from a pull-down, and on a strapping pin that means booting into the ROM
+  # bootloader instead of into the firmware. On GPIO6/GPIO7 the same fault
+  # is merely a bus error.
+  #
+  PIN_I2C_SDA: GPIO06
+  PIN_I2C_SCL: GPIO07
+
   # GPIO10 is one of the few pins on this board with no second job: no
   # strapping function, no ADC channel, no flash, no USB, no UART. GPIO02 - the
   # previous choice - is a strapping pin. It worked, because the pin is
   # high-impedance at reset and a WS2811 data input does not pull it down, but
   # a level shifter, a pulldown or a long noisy cable turns that into a device
   # that boots into download mode now and then.
-  PIN_LED_RING: GPIO10
+  PIN_LED: GPIO10
 
   # ADC1 channel 1. Only GPIO00, GPIO01, GPIO03 and GPIO04 are usable analogue
   # inputs here: everything else is either taken or on ADC2, which the C3
   # cannot read while WiFi is up.
-  PIN_BRIGHTNESS: GPIO01
+  PIN_ADC: GPIO01
 
   #
   # LED ring
@@ -91,7 +106,7 @@ substitutions:
   #
   # Ambient light calibration
   #
-  # The voltage the LDR divider on ${PIN_BRIGHTNESS} produces at the two ends
+  # The voltage the LDR divider on ${PIN_ADC} produces at the two ends
   # of the range the face should react to. The Time effect maps anything in
   # between onto a linear dim factor and clamps outside it. Volts, matching
   # what the Brightness sensor publishes.
@@ -232,9 +247,13 @@ esphome:
   on_boot:
     # priority 600 runs after hardware init, so the ring is already addressable.
     #
-    # Twinkle is the "waiting for the network" indicator, and it now genuinely
-    # is one: nothing switches the ring to the clock face until wifi on_connect
-    # fires. That block used to be a boot trigger at priority 200 testing
+    # Twinkle is the "waiting for a valid time" indicator - which since the
+    # DS1307 was fitted is no longer the same thing as waiting for the network:
+    # the late block below hands over as soon as the RTC has been read, and on
+    # a device with a good battery that is the normal path. SNTP and wifi
+    # on_connect are what cover a dead or missing RTC.
+    #
+    # That block used to be a boot trigger at priority 200 testing
     # wifi.connected, which could never be true - every on_boot trigger runs
     # inside setup(), milliseconds apart, long before the radio associates.
     - priority: 600
@@ -257,6 +276,20 @@ esphome:
         - lambda: |-
             id(reset_count_id) += 1;
 
+    # Before the ring is lit, and after the i2c bus: the bus is a BUS-priority
+    # component (1000) and so is already up, while the DS1307's own setup runs
+    # later at DATA (600) - it does not have to have run, because the action
+    # only needs the bus pointer and address, and those are set before
+    # App.setup() is entered at all.
+    #
+    # read_time() writes the SYSTEM clock, not just this component's, so
+    # everything downstream - the Time effect, show_clock's guard, the
+    # astronomy interval - sees a valid time from here on with no network
+    # involved. That is the entire point of fitting the RTC.
+    - priority: 800
+      then:
+        - ds1307.read_time:
+
     - priority: -100
       then:
         # All three are pushed rather than polled: the version string is a
@@ -266,6 +299,21 @@ esphome:
         - component.update: firmware_version_id
         - component.update: reset_count_sensor_id
         - component.update: reset_reason_id
+
+        # The third caller of show_clock, and the only one that does not need
+        # a network. If the DS1307 delivered a time at priority 800, it is on
+        # the system clock by now and the ring can go straight to the clock
+        # face - a battery-backed clock that sat on the boot indicator until
+        # an access point turned up would be an RTC bought for nothing.
+        #
+        # Runs here rather than at 800 because the guard tests the ACTIVE
+        # EFFECT: Twinkle is selected at priority 600, so at 800 there is not
+        # yet anything for the script to hand over from.
+        #
+        # No guard needed for the RTC being absent, halted or unreadable -
+        # read_time() then leaves the system clock alone, the script's own
+        # is_valid() test fails, and Twinkle stays up exactly as before.
+        - script.execute: show_clock
 
   # There is deliberately no on_shutdown block parking the ring.
   #
@@ -510,6 +558,32 @@ web_server:
 # hand switched off.
 #
 time:
+
+  #
+  # https://esphome.io/components/time/ds1307
+  #
+  # Read once at boot (see on_boot priority 800) and never polled again.
+  # Repeated re-reads would only pull the accurate SNTP time back towards
+  # the drift of a DS1307, which is the wrong direction.
+  #
+  # A NEW OR REPLACED MODULE IS DEAD ON ITS FIRST BOOT, and that is normal.
+  # A DS1307 leaves the factory with CH - the clock-halt bit in register 0
+  # - set, oscillator stopped, registers reading 2000-01-01 00:00:00.
+  # ESPHome refuses to sync from that ("RTC halted, not syncing to system
+  # clock"), so the first boot behaves exactly like a device with no RTC at
+  # all: Twinkle stays up until SNTP lands. The write-back on that first
+  # sync is what clears CH and starts the oscillator - from the second boot
+  # onwards the clock face is up before the radio has associated.
+  #
+  # So a fitted-but-never-set module and a broken one look identical for one
+  # boot. The i2c scan below tells them apart, and so does the CH flag in the
+  # ds1307 DEBUG line.
+  #
+  - platform: ds1307
+    id: ds1307_time
+    address: 0x68
+    update_interval: never
+
   - platform: sntp
     id: sntp_time
     timezone: Europe/Berlin
@@ -518,6 +592,13 @@ time:
       - 1.pool.ntp.org
       - 2.pool.ntp.org
 
+
+    #
+    # Every successful network sync is written back to the RTC, so the
+    # battery-backed time is never more than one sync interval stale. This
+    # is what makes the clock come up right after a power cut without a
+    # network.
+    #
     # The second half of the boot handover, with wifi: on_connect being the
     # first. Associating with an access point that has no route to the internet
     # satisfies on_connect but never produces a time, and the Time effect blanks
@@ -528,7 +609,10 @@ time:
     # Fires on every sync, not only the first; the script's own guard makes the
     # repeats harmless.
     on_time_sync:
-      - script.execute: show_clock
+      then:
+        - ds1307.write_time:
+            id: ds1307_time
+        - script.execute: show_clock
 
 #
 # https://esphome.io/components/logger
@@ -536,6 +620,11 @@ time:
 logger:
   # ERROR only: the ring is driven from a lambda that runs many times a second,
   # and logging at that rate over the api costs more than the messages are worth
+  #
+  #
+  # To debug the RTC, raise this to DEBUG and set i2c scan: True together: the
+  # bus scan prints at CONFIG and the DS1307's own "Read hh:mm:ss / CH:.." line
+  # at DEBUG, so neither is visible here.
   level: ERROR
 
 #
@@ -650,6 +739,77 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+
+#
+# https://esphome.io/components/i2c
+#
+# SUPPLY: the RTC module runs on 3V3, not on 5V. This is not the obvious
+# choice for a DS1307 - the part is specified for 4.5-5.5V - and on most
+# boards carrying one it would not work at all, so the reasoning is worth
+# having in writing. Schematic: docs/TinyRTC-Diagram.jpg.
+#
+# Two things decide it, and both are specific to THIS board.
+#
+# 1. The access threshold. A DS1307 stops answering on the bus whenever VCC
+#    falls below 1.25x the voltage on its VBAT pin. Wire a 3.0V cell
+#    straight to VBAT, as most modules do, and that threshold is 3.75V - the
+#    clock keeps perfect time on 3V3 and simply never replies, which is the
+#    single most common "my DS1307 is broken" report there is.
+#
+#    This board does not wire it straight. R6 (470k) sits in series between
+#    the cell and VBAT, with R4 (1.5M) from VBAT to ground: a divider that
+#    hands the pin 1.5M/1.97M = 0.76 of the cell. A 3.0V CR2032 therefore
+#    presents 2.28V, the threshold lands at 2.86V, and 3V3 clears it.
+#
+#    Consequence: do NOT "fix" R6 by shorting it. That restores the full
+#    3.0V on VBAT, puts the threshold back at 3.75V, and kills the bus.
+#
+# 2. The charging circuit. R5 (200R) and D1 (1N4148) run from VCC to the
+#    cell - this board is built for a rechargeable LIR2032. On 5V that pumps
+#    ~6.5mA into whatever is in the holder, and into a non-rechargeable
+#    CR2032 that means heat, outgassing and eventually a vented cell. On 3V3
+#    the diode never forward-biases at all (3.3 - 0.7 = 2.6V, under any cell
+#    worth having), so the path is simply inert.
+#
+# So: 3V3 and a CR2032. A LIR2032 is the wrong cell here - it would never be
+# recharged and would fall out of the DS1307's 2.0V VBAT minimum within
+# months. The CR2032 is not generous either: at 500nA through the divider's
+# 358k source impedance the pin sees ~2.11V against that 2.0V minimum, so
+# the module will lose the time while the cell still measures near 3V.
+# Losing it is survivable - SNTP re-syncs and writes back - but it is why
+# the boot handover does not assume the RTC answered.
+#
+# Powering the module from 3V3 also keeps the bus pull-ups (R2/R3, 3k3 to
+# VCC) at 3V3. On 5V they would idle the bus at 5V, which is past the
+# absolute maximum of a C3 GPIO and back-feeds the 3V3 rail through the pin
+# clamps.
+#
+# The DS1307 is the only device on this bus and it is a 100kHz part - it
+# does not do fast mode, so there is nothing to gain by raising this.
+#
+# Not quite the only device, in fact: the module also carries an AT24C32
+# EEPROM at 0x50-0x57 (A0-A2 jumpers), unused here. The schematic also shows
+# a DS18B20 - 1-Wire on its own header pin, not on this bus - but that
+# footprint is EMPTY on this build, so there is no temperature sensor to
+# find and nothing to read from that pin.
+#
+# scan is off because the bus holds nothing worth discovering and the scan
+# costs a moment on every boot. Turn it on together with logger level DEBUG
+# when the question is whether the RTC answers: the address list is the
+# fastest way to tell a dead module from a wiring fault, and the EEPROM
+# makes it conclusive - it is a 2.5-5.5V part on the same two wires, so
+# 0x50 without 0x68 would isolate the DS1307 from any wiring doubt.
+#
+# Measured on this build, 2026-08-21: both 0x50 and 0x68 answer on 3V3, so
+# the supply reasoning above is confirmed on hardware and not just on paper.
+#
+i2c:
+  id: i2c_id
+  sda: ${PIN_I2C_SDA}
+  scl: ${PIN_I2C_SCL}
+  frequency: 100kHz
+
+  scan: False
 
 #
 # The one place solar and lunar position are computed. Runs on its own clock so
@@ -1232,7 +1392,7 @@ sensor:
     id: brightness_sensor
     name: Brightness
     icon: mdi:brightness-6
-    pin: ${PIN_BRIGHTNESS}
+    pin: ${PIN_ADC}
     attenuation: 12db
     entity_category: diagnostic
     accuracy_decimals: 3
@@ -1291,9 +1451,10 @@ script:
   #
   # The boot handover: leave the Twinkle indicator and show the clock face.
   #
-  # Called from two places that each know only half of what is needed - wifi:
-  # on_connect knows the radio associated, time: on_time_sync knows there is a
-  # time - so the conditions live here once instead of being half-checked twice.
+  # Called from three places that each know only part of what is needed - wifi:
+  # on_connect knows the radio associated, time: on_time_sync knows a network
+  # sync landed, and the late on_boot block knows the DS1307 has been read - so
+  # the conditions live here once instead of being part-checked three times.
   #
   # Both guards earn their place:
   #
@@ -1305,7 +1466,10 @@ script:
   #   is_valid  the Time effect blanks the ring when the clock is invalid. An
   #             access point with no route to the internet satisfies on_connect
   #             but yields no SNTP, and switching over then would trade a
-  #             visible "waiting" indicator for a black ring.
+  #             visible "waiting" indicator for a black ring. With the RTC
+  #             fitted this is what decides the network-less boot: a readable
+  #             DS1307 makes it true before the radio is anywhere, an absent
+  #             or halted one leaves Twinkle up until SNTP arrives.
   #
   # mode: single - two callers can race on the first successful boot, and the
   # second run would only re-evaluate a guard that no longer holds.
@@ -1652,7 +1816,7 @@ light:
     icon: mdi:led-outline
     chipset: WS2811
     rgb_order: GRB
-    pin: ${PIN_LED_RING}
+    pin: ${PIN_LED}
     num_leds: ${NUM_LEDS}
     default_transition_length: 1s
 

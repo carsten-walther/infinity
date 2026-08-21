@@ -15,6 +15,7 @@ The whole device — configuration and all C++ animations — lives in a single 
 | Framework | ESP-IDF |
 | LED ring | 60× WS2811, GRB, on `GPIO10`, driven via RMT (`esp32_rmt_led_strip`) |
 | Brightness sensor | LDR divider on `GPIO01` (ADC1, 12 dB attenuation) |
+| RTC | DS1307 ("Tiny RTC") on i²c, address `0x68`, `GPIO06` = SDA, `GPIO07` = SCL, **powered from 3V3** |
 
 **The ring needs its own 5 V supply.** 60 LEDs at full white draw around 3.6 A, and
 even the normal clock face at 70 % brightness lights all 60 pixels for something in
@@ -34,18 +35,32 @@ for that reason.
 
 ### Choosing pins on the ESP32-C3
 
-Both pins are set as substitutions at the top of `infinity.yaml`. If you rewire, these
+Board photo and full pinout: [`docs/ESP32-C3.jpg`](docs/ESP32-C3.jpg),
+[`docs/ESP32-C3-Pinout.jpg`](docs/ESP32-C3-Pinout.jpg).
+
+All pins are set as substitutions at the top of `infinity.yaml`. If you rewire, these
 are the constraints on this board:
 
-| GPIO | Usable for |
-| --- | --- |
-| `0`, `1`, `3`, `4` | analogue in (ADC1) or digital |
-| `5` | digital only — ADC2, which cannot be read while WiFi is up |
-| `6`, `7`, `10` | digital, no second function |
-| `2`, `8`, `9` | **strapping pins** — avoid; `8` also drives the on-board RGB LED, `9` is the BOOT button |
-| `11`–`17` | SPI flash, unavailable |
-| `18`, `19` | USB Serial/JTAG |
-| `20`, `21` | UART0 console |
+| GPIO | Usable for | Used here |
+| --- | --- | --- |
+| `0`, `1`, `3`, `4` | analogue in (ADC1) or digital | `1` — LDR |
+| `5` | digital only — ADC2, which cannot be read while WiFi is up | |
+| `6`, `7`, `10` | digital, no second function | `6`/`7` — i²c, `10` — LED ring |
+| `2`, `8`, `9` | **strapping pins** — avoid; `8` also drives the on-board RGB LED, `9` is the BOOT button | |
+| `11`–`17` | SPI flash, unavailable | |
+| `18`, `19` | USB Serial/JTAG | |
+| `20`, `21` | UART0 console | |
+
+All four pins in use are outside the strapping set. `6`, `7` and `10` are free of a
+second function because the `ESP32-C3-MINI-1` module carries its flash in-package on
+`11`–`17`; on a bare C3 with external flash those pins are not necessarily spare.
+
+Keeping the i²c bus off the strapping pins matters more than it does for the other
+peripherals. An idle i²c line rests **high** on its pull-ups, and those pull-ups live
+on the RTC module — so an unpowered, unplugged or miswired module leaves both lines
+low, which a strapping pin cannot tell from a deliberate pull-down. On `GPIO8`/`GPIO9`
+that is a board that boots into the ROM bootloader; on `GPIO6`/`GPIO7` it is a bus
+error and a clock that falls back to SNTP.
 
 The LED ring sat on `GPIO02` originally. That boots, because the pin is
 high-impedance at reset and a WS2811 data input does not pull it down — but a level
@@ -533,15 +548,26 @@ full year, so one set of elements now serves both bodies.
 ### Boot and network
 
 `on_boot` lights `Twinkle`, and nothing switches to the clock face until the
-`show_clock` script says so — so the busy indicator is real. It used to be a boot
+`show_clock` script says so — so the busy indicator is real. Since the RTC was fitted
+it indicates "no valid time yet" rather than "no network yet"; the two stopped being
+the same thing. It used to be a boot
 trigger at priority 200 testing `wifi.connected`, which could never be true: every
 `on_boot` trigger runs inside `setup()`, milliseconds apart, long before the radio
 associates.
 
-`show_clock` is called from two places that each know only half of what is needed —
-`wifi:` `on_connect` knows the radio associated, `time:` `on_time_sync` knows there is
-a time — so both guards live in one script instead of being half-checked twice. It acts
-only if the ring is still on `Twinkle` **and** the clock is valid.
+`show_clock` is called from three places that each know only part of what is needed —
+`wifi:` `on_connect` knows the radio associated, `time:` `on_time_sync` knows a network
+sync landed, and the late `on_boot` block knows the DS1307 has been read — so the
+guards live in one script instead of being part-checked three times. It acts only if
+the ring is still on `Twinkle` **and** the clock is valid.
+
+That third caller is what makes the RTC worth fitting: with a good battery the clock
+face is up before the radio has associated, and a clock that sat on the boot indicator
+waiting for an access point would be an RTC bought for nothing. It runs from the
+`-100` block rather than from the priority-800 one because the guard tests the *active
+effect*, and `Twinkle` is not selected until priority 600. No extra guard is needed for
+a missing or halted RTC: `read_time()` then leaves the system clock alone, the
+`is_valid()` test fails, and `Twinkle` stays up exactly as before.
 
 There is deliberately no `on_disconnect` counterpart. The clock runs off the system
 clock, not off the network, so losing WiFi is no reason to stop showing the time — and
@@ -569,13 +595,97 @@ asks the broker on `esphome/discover/infinity`. Use the address instead:
 esphome logs infinity.yaml --device infinity.local
 ```
 
-The system clock comes from SNTP only. A `time: platform: homeassistant` fallback was
-tried and removed: the API carries time as a uint32 epoch in **seconds**, so every
-15-minute sync discarded the sub-second alignment SNTP had established and stepped the
-clock by up to a second — backwards, usually, since truncation always rounds down. On a
-device whose job is showing seconds that was a visible jump four times an hour. The
-fallback it bought was real — time without a route to the internet — but not at that
-price. If it comes back, it belongs with the second hand switched off.
+The system clock has two sources: SNTP over the network, and the battery-backed
+DS1307 for everything else. A `time: platform: homeassistant` fallback was tried and
+removed: the API carries time as a uint32 epoch in **seconds**, so every 15-minute sync
+discarded the sub-second alignment SNTP had established and stepped the clock by up to
+a second — backwards, usually, since truncation always rounds down. On a device whose
+job is showing seconds that was a visible jump four times an hour. The fallback it
+bought was real — time without a route to the internet — and the RTC now supplies that
+without the jumping.
+
+### The RTC
+
+The DS1307 is read **once**, from `on_boot` at priority 800, and never polled again
+(`update_interval: never`). Re-reading it would only pull the accurate SNTP time back
+towards the drift of a DS1307, which is the wrong direction. The write goes the other
+way: every successful SNTP sync is written back to the RTC, so the battery-backed time
+is never more than one sync interval stale.
+
+`read_time()` sets the **system** clock rather than just its own component's, so the
+`Time` effect, the `show_clock` guard and the astronomy interval all see a valid time
+from priority 800 onwards with no network involved.
+
+**A new module is dead on its first boot, and that is normal.** A DS1307 ships with
+`CH` — the clock-halt bit in register 0 — set, oscillator stopped, registers reading
+`2000-01-01 00:00:00`. ESPHome refuses to sync from that (`RTC halted, not syncing to
+system clock`), so the first boot behaves exactly like a device with no RTC: `Twinkle`
+stays up until SNTP lands. The write-back on that first sync clears `CH` and starts the
+oscillator — from the **second** boot onwards the clock face is up before the radio has
+associated. A fitted-but-never-set module and a dead one therefore look identical for
+exactly one boot; the i²c scan and the `CH` flag in the `ds1307` DEBUG line tell them
+apart.
+
+Priority 800 sits between the i²c bus (a `BUS`-priority component at 1000, so already
+up) and the DS1307's own `setup()` at `DATA` (600, so not yet run) — which is fine,
+because the action needs only the bus pointer and the address, and both are assigned
+before `App.setup()` is entered.
+
+#### Why the module runs on 3V3, not 5V
+
+A DS1307 is specified for 4.5–5.5 V, so this looks wrong, and on most boards carrying
+one it *would* be. Two details of this particular module decide it — see
+[`docs/TinyRTC-Diagram.jpg`](docs/TinyRTC-Diagram.jpg).
+
+**The access threshold.** A DS1307 stops answering on the bus whenever V_CC drops below
+1.25 × the voltage on its `VBAT` pin. Wire a 3.0 V cell straight to `VBAT`, as most
+modules do, and the threshold is 3.75 V: on 3V3 the clock keeps perfect time and simply
+never replies — the single most common "my DS1307 is broken" report there is.
+
+This board puts a divider in the way. `R6` (470 kΩ) sits in series between the cell and
+`VBAT`, `R4` (1.5 MΩ) runs from `VBAT` to ground, so the pin sees 1.5/1.97 = **0.76** of
+the cell:
+
+| Cell | `VBAT` pin | Access threshold (1.25 ×) | Answers on 3V3? |
+| --- | --- | --- | --- |
+| CR2032, 3.0 V | 2.28 V | 2.86 V | yes — **confirmed on hardware** |
+| CR2032, 2.8 V | 2.13 V | 2.66 V | yes |
+| LIR2032, 3.6 V | 2.74 V | 3.43 V | marginal |
+| *no divider* (`R6` shorted) | 3.00 V | 3.75 V | **no** |
+
+That last row is a warning, not a suggestion: shorting `R6` to "fix" the low backup
+voltage is exactly what breaks the bus.
+
+**The charging circuit.** `R5` (200 Ω) and `D1` (1N4148) run from V_CC to the cell — the
+module is built for a rechargeable LIR2032. On 5 V that pushes **≈ 6.5 mA** into
+whatever is in the holder; into a non-rechargeable CR2032 that means heat, outgassing
+and eventually a vented cell. On 3V3 the diode never forward-biases (3.3 − 0.7 = 2.6 V,
+below any usable cell), so the path is inert.
+
+**So: 3V3 with a CR2032.** A LIR2032 is the wrong cell at this voltage — it would never
+be recharged and would drop out of the DS1307's 2.0 V `VBAT` minimum within months. The
+CR2032 is not generous either: at 500 nA through the divider's 358 kΩ source impedance
+the pin sits at ≈ 2.11 V against that 2.0 V minimum, so the module will lose the time
+while the cell still measures close to 3 V. That is survivable — SNTP re-syncs and
+writes back — and it is why the boot handover never assumes the RTC answered.
+
+Powering the module from 3V3 also keeps the bus pull-ups (`R2`/`R3`, 3.3 kΩ to V_CC) at
+3V3. On 5 V they would idle the bus at 5 V, past the absolute maximum of a C3 GPIO and
+back-feeding the 3V3 rail through the pin clamps.
+
+Photos of the module as fitted: [`docs/TinyRTC-001.jpg`](docs/TinyRTC-001.jpg),
+[`docs/TinyRTC-002.jpg`](docs/TinyRTC-002.jpg).
+
+#### What else is on the module
+
+An **AT24C32** EEPROM at `0x50`–`0x57` (set by the `A0`–`A2` jumpers) shares the bus,
+unused here. The schematic also shows a **DS18B20** temperature sensor on a 1-Wire
+header pin — but **that footprint is unpopulated on this build**, so there is nothing
+to read there.
+
+The EEPROM is worth knowing about for one reason: it is a 2.5–5.5 V part on the same
+two wires as the RTC, so an i²c scan listing `0x50` but not `0x68` isolates the DS1307
+from any wiring doubt.
 
 An OTA update parks the light for its duration — the effect lambdas and RMT transfers
 otherwise compete with the transfer for CPU and for the WiFi stack, which matters more
