@@ -1541,6 +1541,24 @@ script:
 # How long the alarm pulses before standing down on its own. There is
 # deliberately no snooze - this is a clock, not a bedside console.
 #
+# update_interval: never here and on the nine other optimistic template
+# entities below - the two datetimes, the five texts and the two selects.
+# Their update() only does anything when the entity has a `lambda:` to poll
+# (TemplateSelect goes further and compiles update() away entirely, behind an
+# `if constexpr (HAS_LAMBDA)`), and none of these has one: the value IS the
+# stored state, written by whoever set it. At the schema default of 60s they
+# were ten scheduler wake-ups a minute reaching a function that returns
+# immediately.
+#
+# The saving is negligible and that is not the point. The template SENSORS in
+# this file already say `never`, with a paragraph each on why polling a value
+# that cannot change is waste - these ten contradicted that and read as though
+# the polling had a reason.
+#
+# Three entities do still poll, and must: Uptime and WiFi Signal read hardware,
+# and Device Uptime is a template text_sensor WITH a lambda - the string it
+# formats is exactly what update() recomputes.
+#
 number:
   - platform: template
     id: alarm_duration_id
@@ -1555,6 +1573,7 @@ number:
     optimistic: true
     restore_value: true
     entity_category: config
+    update_interval: never
 
 #
 # https://esphome.io/components/datetime/template
@@ -1574,6 +1593,7 @@ datetime:
     optimistic: true
     restore_value: true
     initial_value: "09:00:00"
+    update_interval: never
     on_time:
       - if:
           condition:
@@ -1617,6 +1637,7 @@ datetime:
     type: DATETIME
     optimistic: true
     entity_category: config
+    update_interval: never
     set_action:
       - lambda: |-
           // x carries only the fields the call set, zero-initialised and with
@@ -1764,6 +1785,7 @@ text:
     min_length: 7
     max_length: 7
     initial_value: '#1006cd'
+    update_interval: never
 
   - platform: template
     name: Color minute
@@ -1776,6 +1798,7 @@ text:
     min_length: 7
     max_length: 7
     initial_value: '#d200b6'
+    update_interval: never
 
   - platform: template
     name: Color second
@@ -1788,6 +1811,7 @@ text:
     min_length: 7
     max_length: 7
     initial_value: '#2DFF49'
+    update_interval: never
 
   #
   # Where the device is, in decimal degrees, north and east positive. The
@@ -1811,6 +1835,7 @@ text:
     min_length: 1
     max_length: 12
     initial_value: '${DEFAULT_LATITUDE}'
+    update_interval: never
 
   - platform: template
     name: Longitude
@@ -1823,6 +1848,7 @@ text:
     min_length: 1
     max_length: 12
     initial_value: '${DEFAULT_LONGITUDE}'
+    update_interval: never
 
 #
 # The option ORDER is load-bearing: the Time effect switches on
@@ -1856,6 +1882,7 @@ select:
     initial_option: "Normal"
     optimistic: true
     restore_value: true
+    update_interval: never
 
   # The first option is "Off" and NOT "None" on purpose. Home Assistant's MQTT
   # integration treats the literal payload "None" as its PAYLOAD_NONE sentinel,
@@ -1875,6 +1902,7 @@ select:
     initial_option: "Off"
     optimistic: true
     restore_value: true
+    update_interval: never
 
 #
 # The clock face itself. The five animations written for this device - Time,
@@ -2040,49 +2068,9 @@ light:
             auto indicator = id(infinity_indicator).active_index();
             auto enable_seconds = id(global_enable_seconds);
 
-            // this face colours the clock in 2 sections, the c1->c2 divide
-            // represents the minute hand and the c2->c1 divide represents the hour hand.
-            Color c1;
-            Color c1blend;
-            Color c2;
-            Color c2blend;
-
-            int gap;
-            int firsthand = std::min(hour_pos, minute_pos);
-            int secondhand = std::max(hour_pos, minute_pos);
-
-            Color hour_color = parseColor(id(infinity_color_hour).state, Color(255, 0, 0));
-            Color minute_color = parseColor(id(infinity_color_minute).state, Color(0, 255, 0));
-            Color second_color = parseColor(id(infinity_color_second).state, Color(0, 0, 255));
-
-            // check which hand is first, so we know what colour the 0 pixel is
-            //
-            // The else branch used to build c1 as (r, b, g) - green and blue
-            // swapped. That was invisible while hour_color was hard-coded pure
-            // red, but the colour is user-supplied now, so any hand colour with
-            // two components would have rendered differently depending on
-            // whether the hour or the minute hand came first.
-            if (hour_pos > minute_pos) {
-              c2 = Color(hour_color.r, hour_color.g, hour_color.b);
-              c1 = Color(minute_color.r, minute_color.g, minute_color.b);
-            } else {
-              c1 = Color(hour_color.r, hour_color.g, hour_color.b);
-              c2 = Color(minute_color.r, minute_color.g, minute_color.b);
-            }
-
-            // Each arc runs from its blend colour at the hand it starts on to
-            // the full hand colour at the far end. FACE_BLEND is how far towards
-            // the OTHER hand's colour that starting point is pulled, so a bigger
-            // value is a wider, more obvious ramp and 0 is two flat arcs.
-            //
-            // This used to read `(float) blendPoint / 255` with blendPoint set
-            // to 0.5 - a blend factor of 0.00196. With the default palette that
-            // put each arc between (209,0,182) and (210,0,182): one step of one
-            // channel over thirty pixels. The face rendered as two solid arcs
-            // and the comment here promised a gradient that was never drawn. The
-            // /255 is the leftover; blendPoint was clearly once an int 0-255.
-            c2blend = linearBlend(c2, c1, ${FACE_BLEND}f);
-            c1blend = linearBlend(c1, c2, ${FACE_BLEND}f);
+            const Color hour_color = parseColor(id(infinity_color_hour).state, Color(255, 0, 0));
+            const Color minute_color = parseColor(id(infinity_color_minute).state, Color(0, 255, 0));
+            const Color second_color = parseColor(id(infinity_color_second).state, Color(0, 0, 255));
 
             // "Simple" shows the hands as bare dots, so there is no gradient to
             // build. The ring has to be cleared explicitly: the frame buffer is
@@ -2120,7 +2108,50 @@ light:
                     darken(linearBlend(minute_color, hour_color, t), ${GRADIENT_DIM}f);
               }
             } else {
-              gap = secondhand - firsthand;
+              // Everything from here to the end of the branch belongs to the
+              // Normal face alone. It used to sit above the branch, so Simple
+              // and Gradient built two Colors, ran two linearBlends and a
+              // min/max every frame and then threw the lot away - and `gap`
+              // was declared uninitialised up there, only ever written down
+              // here.
+              //
+              // This face colours the clock in 2 sections: the c1->c2 divide
+              // is the minute hand and the c2->c1 divide is the hour hand.
+              //
+              // Which hand comes first decides what colour pixel 0 carries.
+              // The two arms used to be spelled out channel by channel, and
+              // one of them read (r, b, g) - green and blue swapped. That was
+              // invisible while hour_color was hard-coded pure red, but the
+              // colour is user-supplied now, so any hand colour with two
+              // components rendered differently depending on which hand came
+              // first. Copying the whole Color cannot reintroduce that.
+              const bool hour_first = hour_pos <= minute_pos;
+              const Color c1 = hour_first ? hour_color : minute_color;
+              const Color c2 = hour_first ? minute_color : hour_color;
+
+              // Each arc runs from its blend colour at the hand it starts on to
+              // the full hand colour at the far end. FACE_BLEND is how far towards
+              // the OTHER hand's colour that starting point is pulled, so a bigger
+              // value is a wider, more obvious ramp and 0 is two flat arcs.
+              //
+              // This used to read `(float) blendPoint / 255` with blendPoint set
+              // to 0.5 - a blend factor of 0.00196. With the default palette that
+              // put each arc between (209,0,182) and (210,0,182): one step of one
+              // channel over thirty pixels. The face rendered as two solid arcs
+              // and the comment here promised a gradient that was never drawn. The
+              // /255 is the leftover; blendPoint was clearly once an int 0-255.
+              const Color c2blend = linearBlend(c2, c1, ${FACE_BLEND}f);
+              const Color c1blend = linearBlend(c1, c2, ${FACE_BLEND}f);
+
+              const int firsthand = std::min(hour_pos, minute_pos);
+              const int secondhand = std::max(hour_pos, minute_pos);
+
+              // Not a division by zero when the hands share a pixel, which they
+              // do for five minutes in every twelve hours (01:05, 02:10, ...):
+              // gap is 0 only when firsthand == secondhand, and the loop that
+              // divides by it does not run in that case. The second gap is then
+              // the full ring and the whole face is drawn by the loop below.
+              int gap = secondhand - firsthand;
 
               // create the blend between first and 2nd hand
               for (int i = firsthand; i < secondhand; i++) {
