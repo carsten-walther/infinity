@@ -163,7 +163,7 @@ substitutions:
   # TAIL is the length of the trail in pixels. Needs a decimal point: the lambda
   # appends "f" to build a float literal.
   #
-  HAND_FADE_MS: "999"
+  HAND_FADE_MS: "1000"
   HAND_TAIL: "3.0"
 
   #
