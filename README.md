@@ -13,16 +13,18 @@ The whole device — configuration and all C++ animations — lives in a single 
 | --- | --- |
 | Board | ESP32-C3 (`esp32-c3-devkitm-1`) |
 | Framework | ESP-IDF |
-| LED ring | 60× WS2811, GRB, on `GPIO10`, driven via RMT (`esp32_rmt_led_strip`) |
+| LED ring | 60× WS2812, GRB, on `GPIO10`, driven via RMT (`esp32_rmt_led_strip`) |
 | Brightness sensor | LDR divider on `GPIO01` (ADC1, 12 dB attenuation) |
 | RTC | DS1307 ("Tiny RTC") on i²c, address `0x68`, `GPIO06` = SDA, `GPIO07` = SCL, **powered from 3V3** |
+| Supply | USB power supply → MP1584EN adjustable step-down → ring and board in parallel |
 
-**The ring needs its own 5 V supply.** 60 LEDs at full white draw around 3.6 A, and
-even the normal clock face at 70 % brightness lights all 60 pixels for something in
-the region of 1–2 A. Feeding that through the DevKit's `5V` pin routes the whole
-current across the USB connector, the board traces and the ground return — far beyond
-what a devkit is built for, and the usual reason one of these boards "runs hot". Power
-the ring directly from the supply and join only the grounds.
+**The ring's current must never cross the DevKit.** 60 LEDs at full white draw around
+3.6 A, and even the normal clock face at 70 % brightness lights all 60 pixels for
+something in the region of 1–2 A. Feeding that through the DevKit's `5V` pin routes the
+whole current across the USB connector, the board traces and the ground return — far
+beyond what a devkit is built for, and the usual reason one of these boards "runs hot".
+Ring and board therefore hang off the supply as two separate pairs of wires that meet
+only at the terminals they both come from — see [The 5 V supply](#the-5-v-supply).
 
 60 LEDs is not a decorative choice: one pixel per minute means a pixel index *is* the
 minute (and second) value, and the hour hand belongs at `(hour % 12) * 5` — plus
@@ -32,6 +34,75 @@ effect and indicator maths assumes that mapping.
 Note the framework: no Arduino-only APIs (`String`, `WiFi.*`, `byte`, the `min`/`max`
 macros) work in a lambda here. The effects use `std::min` / `std::max` / `std::abs`
 for that reason.
+
+### The 5 V supply
+
+A USB power supply feeds an **MP1584EN** adjustable step-down module, and the ring and
+the board hang off its output in parallel:
+
+```
+USB PSU ──▶ IN+ ─┐                ┌─ OUT+ ──┬──▶ ESP32-C3  5V
+   (5 V)         │   MP1584EN     │         └──▶ LED ring  +
+        ──▶ IN− ─┘  (step-down)   └─ OUT− ──┬──▶ ESP32-C3  GND
+                                            └──▶ LED ring  −
+```
+
+Photos: [`docs/Step-Down-MP1584-001.jpg`](docs/Step-Down-MP1584-001.jpg) (top),
+[`docs/Step-Down-MP1584-002.jpg`](docs/Step-Down-MP1584-002.jpg) (bottom). The bottom
+silkscreen is the entire pinout — `IN+`/`IN−` at one end, `OUT+`/`OUT−` at the other, an
+arrow pointing from in to out. On top sit the MP1584EN in SOIC-8, a 4.7 µH inductor
+(`4R7`), an `SS34` Schottky and the trimmer that sets the output voltage. The MP1584 is
+a **non-synchronous** buck: it integrates the high-side switch only, which is why the
+catch diode is a discrete part on the board instead of a second MOSFET inside the chip.
+
+**Set the output before the load is connected.** These modules ship at whatever the
+trimmer was last left at, the trimmer is multiturn with no marked direction, and the
+first thing a wrong setting reaches is 60 LEDs and an ESP32. Meter on `OUT`, nothing
+else attached.
+
+#### What running it from 5 V costs, and what it buys
+
+**It cannot actually produce 5 V.** A buck converter steps *down* — it has no mechanism
+for reaching its own input voltage, and the MP1584 in particular drives its high-side
+switch from a bootstrap capacitor that needs the switch node pulled low periodically to
+recharge, so 100 % duty cycle is not merely inefficient but unreachable. Its specified
+minimum input is 4.5 V. Fed from a 5 V USB supply, the output is necessarily *below*
+5 V, by an amount set by the trimmer and by how far the supply sags under load.
+
+For the ring that is mostly good news. A WS2812's logic threshold is 0.7 × V_DD: at a
+true 5.0 V that is **3.5 V**, which an ESP32-C3 pin driving 3.3 V never reaches — the
+standard reason a WS2812 ring on a 3.3 V controller works "mostly", with an
+occasional wrong pixel and no obvious cause. At 4.4 V the threshold falls to 3.08 V and
+the data line has real margin, so the converter is quietly doing a level shifter's job.
+Do not chase those millivolts back: below roughly 4 V the blue die runs out of
+forward-voltage headroom before red and green do, and flat white drifts warm.
+
+**The current budget is set by the USB supply, not by the module.** With input and
+output nearly equal there is no voltage ratio to trade, and therefore no current gain
+either — the supply has to source very nearly the whole ring current, plus the board:
+
+| Ring state | Ring current | Drawn from the USB supply |
+| --- | --- | --- |
+| Clock face at 70 % (normal operation) | 1–2 A | 1–2 A |
+| Full white at 100 % | 3.6 A | ≈ 3.7 A, i.e. 18 W |
+
+A typical USB supply stops at 2.4 A, and this module — 3 A at the chip, considerably
+less on a board this size with no heatsinking — stops short of full white as well.
+Nothing in `infinity.yaml` prevents asking for it: there is no `max_power`, so setting
+the light to 100 % white requests a current that no part of this chain can deliver. The
+rail sags, and a sagging rail produces exactly the brief wrong-coloured pixels described
+under [Power and heat](#power-and-heat). If the ring ever has to run bright, the fix
+belongs at the supply and not in the firmware.
+
+The losses at this operating point are the opposite of the usual ones: duty cycle sits
+near 100 %, so the internal switch (≈ 100 mΩ) is conducting almost permanently and
+dissipates I²R rather than switching loss — about 0.4 W at 2 A — while the `SS34` barely
+conducts at all. The hot spot is the chip, not the diode.
+
+**If this is ever rebuilt, feed the converter from 9–12 V instead.** Then it works the
+way a buck is supposed to: 2 A out at 5 V costs only about 0.9 A in at 12 V, the input
+side stops being the bottleneck, and the output no longer tracks a sagging 5 V rail. The
+trade is that the `SS34` then carries real current and becomes the part that gets warm.
 
 ### Choosing pins on the ESP32-C3
 
@@ -63,7 +134,7 @@ that is a board that boots into the ROM bootloader; on `GPIO6`/`GPIO7` it is a b
 error and a clock that falls back to SNTP.
 
 The LED ring sat on `GPIO02` originally. That boots, because the pin is
-high-impedance at reset and a WS2811 data input does not pull it down — but a level
+high-impedance at reset and a WS2812 data input does not pull it down — but a level
 shifter, a pulldown or a long noisy cable turns it into a board that occasionally
 comes up in download mode. RMT reaches any pin through the GPIO matrix, so there is
 no reason to spend a strapping pin on it.
@@ -189,7 +260,7 @@ none of that came from the strip. Two settings brought it down to **38–41 °C*
 free — nothing here is compute-bound — but it also halves the margin on **interrupt
 latency**, and the LED ring depends on that. `esp32_rmt_led_strip` drives the strip
 from a 96-symbol RMT buffer (the C3 maximum: two 48-symbol blocks, so there is no
-headroom to configure), which at WS2811 timing holds about 133 µs of data. The refill
+headroom to configure), which at WS2812 timing holds about 134 µs of data. The refill
 ISR therefore has to run every ~67 µs for the whole ~2 ms a frame takes. Miss it once
 and every LED past that point takes shifted bits — a handful of pixels in the wrong
 colour for one frame, on a chip that is also servicing WiFi, the API, MQTT and a web
@@ -444,7 +515,7 @@ when the clock is invalid, so handing over on association alone would trade a vi
 Switching the light on from Home Assistant always returns to that same state, whatever
 effect or colour was set before.
 
-The ring is **not** darkened on shutdown, and cannot be: WS2811s latch their last frame
+The ring is **not** darkened on shutdown, and cannot be: WS2812s latch their last frame
 and ESPHome's restart path gives the light no chance to write another one. It keeps
 showing whatever it was showing until the new firmware boots. See *Known limitations*.
 
@@ -503,7 +574,7 @@ face.
   `on_shutdown()` on every component and then restarts immediately, while the strip is
   only ever written from `LightState::loop()` — and neither `light_state` nor
   `esp32_rmt_led_strip` implements `on_shutdown` or `teardown`, so that loop never runs
-  again. A `light.turn_off` there sets `next_write_` and nothing consumes it. WS2811s
+  again. A `light.turn_off` there sets `next_write_` and nothing consumes it. WS2812s
   latch, so the last frame stays lit through the restart. The config used to carry such
   a block; it was removed rather than left looking as if it worked.
 - **No die temperature.** `internal_temperature` and the ESPHome `debug` component both

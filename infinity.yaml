@@ -35,7 +35,7 @@ substitutions:
   # GPIO10 is one of the few pins on this board with no second job: no
   # strapping function, no ADC channel, no flash, no USB, no UART. GPIO02 - the
   # previous choice - is a strapping pin. It worked, because the pin is
-  # high-impedance at reset and a WS2811 data input does not pull it down, but
+  # high-impedance at reset and a WS2812 data input does not pull it down, but
   # a level shifter, a pulldown or a long noisy cable turns that into a device
   # that boots into download mode now and then.
   PIN_LED: GPIO10
@@ -78,9 +78,12 @@ substitutions:
 
   #
   # Brightness the clock comes back to on boot and on every switch-on. 60 LEDs
-  # at full white draw around 3.6 A - the ring runs on its own supply here, so
-  # that is a question for the power brick rather than for the board, but it is
-  # also far brighter than a room needs.
+  # at full white draw around 3.6 A. That current never crosses the DevKit - the
+  # ring hangs off the step-down converter's output in parallel with the board -
+  # but the USB brick feeding that converter cannot source it either, and there
+  # is no max_power here to stop anyone asking. 70% is far brighter than a room
+  # needs, and it is also inside what the supply can actually deliver. See "The
+  # 5 V supply" in README.md.
   #
   DEFAULT_BRIGHTNESS: "70%"
 
@@ -329,7 +332,7 @@ esphome:
   # explicit length takes the transition branch, so even with a loop it would
   # only have STARTED a 1s fade that the restart cuts off mid-way.
   #
-  # WS2811s latch their last frame, so the ring keeps showing whatever it showed
+  # WS2812s latch their last frame, so the ring keeps showing whatever it showed
   # right through the restart either way. Better an honest gap than a line that
   # looks like it handles this.
 
@@ -348,7 +351,7 @@ esp32:
   #
   # What it was not free of is INTERRUPT latency. The LED ring is driven from
   # RMT with a 96-symbol buffer - the C3 maximum, two 48-symbol blocks - which
-  # at WS2811 timing is about 133 us of data, so the refill ISR has to run
+  # at WS2812 timing is about 134 us of data, so the refill ISR has to run
   # every ~67 us for the whole 2 ms of a frame. Miss it once and every LED
   # after that point takes shifted bits: a handful of pixels in the wrong
   # colour for one frame. Halving the clock halves the margin on that, on a
@@ -410,8 +413,8 @@ wifi:
 
   # LIGHT, not the NONE this started with: NONE keeps the radio powered up
   # permanently, which was the single largest heat source on this board - the
-  # die sat at 67 C with the LED ring on its own supply, so none of that was
-  # coming from the strip. LIGHT maps to WIFI_PS_MIN_MODEM, which sleeps between
+  # die sat at 67 C with the ring fed from the converter rather than through the
+  # board, so none of that was coming from the strip. LIGHT maps to WIFI_PS_MIN_MODEM, which sleeps between
   # DTIM beacons and wakes for every one of them.
   #
   # Measured: 67 C -> 38-41 C. That was together with a cpu_frequency of 80MHZ,
@@ -1918,7 +1921,7 @@ light:
     id: led_ring_id
     name: LED color
     icon: mdi:led-outline
-    chipset: WS2811
+    chipset: WS2812
     rgb_order: GRB
     pin: ${PIN_LED}
     num_leds: ${NUM_LEDS}
