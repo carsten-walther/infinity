@@ -236,6 +236,21 @@ substitutions:
   ALARM_GREEN: "0"
   ALARM_BLUE: "0"
 
+  #
+  # Hourly animation
+  #
+  # How long the full-hour animation runs before handing the ring back to the
+  # clock face. Short on purpose: this is a chime, not a light show, and the
+  # thing it interrupts is the one display this device exists to show.
+  #
+  # Do not set a transition_length anywhere near this. A light call that carries
+  # both an effect and a transition has the transition stripped and logs
+  # "effect cannot be used with transition/flash" (light_call.cpp), and a call
+  # that carries an effect never gets the default transition applied in the
+  # first place - so the window really is this long, start to finish.
+  #
+  HOURLY_DURATION: "3s"
+
 #
 # https://esphome.io/components/esphome
 #
@@ -381,11 +396,12 @@ esp32:
     type: esp-idf
 
 #
-# Twelve things persist here - the three hand colours, the two coordinates, the
-# alarm time, its duration and its arming switch, both selects, the seconds
-# switch and the reset count - and every one of them lands in the same flash
-# sector. The MQTT switch is not among them: it is ALWAYS_OFF, which neither
-# reads nor writes a preference.
+# Fifteen things persist here - the three hand colours, the two coordinates,
+# the alarm time, its duration and its arming switch, the hourly animation's
+# arming switch, all three selects, the seconds and smooth-hands switches and
+# the reset count - and
+# every one of them lands in the same flash sector. The MQTT switch is not
+# among them: it is ALWAYS_OFF, which neither reads nor writes a preference.
 #
 # The default buffers writes for 60s; 5min buffers a burst of slider-dragging in
 # Home Assistant into a single erase cycle instead of several.
@@ -598,6 +614,19 @@ time:
   - platform: sntp
     id: sntp_time
     timezone: Europe/Berlin
+
+    # The full-hour animation. On the sntp component rather than the ds1307
+    # because this is the wall clock everything else here reads - but note that
+    # a cron trigger evaluates the SYSTEM clock, so it fires just as well on a
+    # network-less boot where the DS1307 was what set that clock.
+    #
+    # Fields are seconds minutes hours day-of-month month day-of-week, so this
+    # is second 0 of minute 0, every hour. CronTrigger checks is_valid() before
+    # firing, so an unsynced clock produces no midnight burst.
+    on_time:
+      - cron: "0 0 * * * *"
+        then:
+          - script.execute: hourly_script
     servers:
       - 0.pool.ntp.org
       - 1.pool.ntp.org
@@ -687,6 +716,16 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+
+  #
+  # Mirrors the Smooth hands switch, for the same reason and read in the same
+  # place. Initialised to 1 because the switch defaults on; the switch's restore
+  # overwrites this during setup either way.
+  #
+  - id: global_smooth_hands
+    type: int
+    restore_value: no
+    initial_value: '1'
 
   #
   # Survives restarts, so a rising count is proof the device rebooted even if
@@ -1546,6 +1585,62 @@ script:
                 else:
                   - light.turn_off: led_ring_id
 
+  #
+  # The full-hour animation.
+  #
+  # Three conditions, and all three are about NOT surprising anyone:
+  #
+  #   enabled    the switch is the whole point of the feature.
+  #
+  #   is_on      an alarm turns a dark ring on because that is what an alarm is
+  #              for. This is the opposite: a ring someone switched off should
+  #              stay off, not light up the room once an hour, all night.
+  #
+  #   Time       only the clock face gets interrupted. Anyone watching Fire, or
+  #              a running Alarm, or something picked by hand in Home Assistant
+  #              has said what they want the ring to show, and taking it away
+  #              for two seconds every hour would be a bug rather than a chime.
+  #              It also removes any need to remember what to restore: the only
+  #              thing this can interrupt is the thing it returns to.
+  #
+  # Nothing here sets brightness or colour, unlike alarm_script. The alarm wants
+  # 100% and then puts DEFAULT_BRIGHTNESS back; doing that here would quietly
+  # undo a dimmed ring every hour, on the hour.
+  #
+  # mode: single is free at this rate - two runs are an hour apart - but it is
+  # also correct: a second run could only re-check a guard that still holds.
+  #
+  - id: hourly_script
+    mode: single
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: hourly_enabled_id
+              - light.is_on: led_ring_id
+              - lambda: return id(led_ring_id).get_effect_name().str() == "Time";
+          then:
+            - light.turn_on:
+                id: led_ring_id
+                effect: !lambda return id(hourly_effect_id).current_option().str();
+
+            - delay: ${HOURLY_DURATION}
+
+            # Stand down only if the animation is still what is showing. The
+            # comparison is against the SELECT, not a remembered name: someone
+            # who reached for Home Assistant during those two seconds and
+            # picked something else has taken over, and yanking it back to the
+            # clock would fight them. Same reasoning as the alarm's guard.
+            - if:
+                condition:
+                  lambda: |-
+                    return id(led_ring_id).get_effect_name().str() ==
+                           id(hourly_effect_id).current_option().str();
+                then:
+                  - light.turn_on:
+                      id: led_ring_id
+                      effect: Time
+
 #
 # https://esphome.io/components/number/template
 #
@@ -1746,6 +1841,21 @@ switch:
     restore_mode: RESTORE_DEFAULT_OFF
 
   #
+  # Arms the full-hour animation. Separate from Hourly Effect for the same
+  # reason Alarm Enabled is separate from Alarm Time: switching the feature off
+  # for an evening should not cost the setting.
+  #
+  # RESTORE_DEFAULT_OFF, so it survives a reboot but a fresh flash comes up
+  # quiet. Spelled out because the schema default is ALWAYS_OFF.
+  #
+  - platform: template
+    name: Hourly Enabled
+    icon: mdi:clock-check-outline
+    id: hourly_enabled_id
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  #
   # Kept optimistic on purpose: the state lives in global_enable_seconds, which
   # the effect reads at frame rate, so there is nothing to read back from.
   #
@@ -1768,6 +1878,37 @@ switch:
       then:
         lambda: |-
           id(global_enable_seconds) = 0;
+
+  #
+  # Whether the hands move as sliding comets or as single pixels.
+  #
+  # On (the default, and how this has always behaved): each hand fades from its
+  # old pixel to the new one over HAND_FADE_MS with a HAND_TAIL-pixel tail
+  # behind it, so a step reads as movement rather than as a teleport.
+  #
+  # Off: one pixel per hand, exactly. The comet is what makes a hand occupy
+  # three or four LEDs at once, and on a 60-pixel ring that is a real trade -
+  # it is motion at the cost of being able to say precisely which minute the
+  # hand is on. This switch is that trade, made visible.
+  #
+  # RESTORE_DEFAULT_ON, not OFF: this is the behaviour the clock has had all
+  # along, so a device that reboots without a stored preference has to come back
+  # looking the way it did before.
+  #
+  - platform: template
+    name: Smooth hands
+    icon: mdi:motion-outline
+    id: infinity_smooth_hands
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      then:
+        lambda: |-
+          id(global_smooth_hands) = 1;
+    turn_off_action:
+      then:
+        lambda: |-
+          id(global_smooth_hands) = 0;
 
 #
 # Hand colours as "#RRGGBB". These entities ARE the stored value - the Time
@@ -1911,6 +2052,31 @@ select:
       - "Quarters"
       - "Hour marks"
     initial_option: "Off"
+    optimistic: true
+    restore_value: true
+    update_interval: never
+
+  # Which animation the full hour runs. The option strings are effect names and
+  # have to stay spelled exactly as the light: block spells them - the script
+  # hands this state straight to light.turn_on's effect:, and a mismatch is a
+  # silent no-op rather than an error: LightCall logs "invalid effect index",
+  # clears the flag and carries on, so the ring would simply keep showing the
+  # clock at every full hour with nothing in the log to explain it.
+  #
+  # Only the stock effects are offered. Time is the thing being
+  # interrupted, Alarm means something specific on this device, and Sun and Moon
+  # are readouts rather than animations - none of the four is a chime.
+  - platform: template
+    name: Hourly Effect
+    icon: mdi:animation-play-outline
+    id: hourly_effect_id
+    options:
+      - "Rainbow"
+      - "Color Wipe"
+      - "Fireworks"
+      - "Twinkle"
+      - "Random Twinkle"
+    initial_option: "Twinkle"
     optimistic: true
     restore_value: true
     update_interval: never
@@ -2086,6 +2252,7 @@ light:
             auto face_type = id(infinity_face_type).active_index();
             auto indicator = id(infinity_indicator).active_index();
             auto enable_seconds = id(global_enable_seconds);
+            const bool smooth_hands = id(global_smooth_hands) != 0;
 
             const Color hour_color = parseColor(id(infinity_color_hour).state, Color(255, 0, 0));
             const Color minute_color = parseColor(id(infinity_color_minute).state, Color(0, 255, 0));
@@ -2194,6 +2361,13 @@ light:
             // ring of discrete pixels reads as two separate states rather than
             // as movement.
             //
+            // The Smooth hands switch turns all of that off, leaving one pixel
+            // per hand - see drawHand below. The bookkeeping here still runs in
+            // that case: it is three comparisons and three stores per frame,
+            // and keeping it unconditional means the comets resume mid-stride
+            // when the switch goes back on, instead of every hand jumping
+            // because its timestamp went stale while it was off.
+            //
             // The positions are recomputed from the clock every frame, so the
             // only state kept here is WHEN each one last changed.
             constexpr uint32_t FADE_MS = ${HAND_FADE_MS};
@@ -2244,6 +2418,15 @@ light:
             // pure comet, on Normal and Gradient it is a highlight that melts
             // back into the ramp.
             auto drawHand = [&](int pos, Color color, float fade) {
+              // One pixel, no comet. Assigned rather than blended because the
+              // comet's head at level 1.0 blends to exactly this - so the two
+              // branches agree on where a settled hand sits, and the switch
+              // only ever adds or removes what trails it.
+              if (!smooth_hands) {
+                it[((pos % (int) it.size()) + (int) it.size()) % (int) it.size()] = color;
+                return;
+              }
+
               for (int d = 0; d <= (int) TAIL + 1; d++) {
                 const float s = (float) d - 1.0f + fade;
 

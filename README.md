@@ -59,7 +59,7 @@ That matters for where the heat ends up — see below.
 **Set the output before the load is connected.** These modules ship at whatever the
 trimmer was last left at, the trimmer is multiturn with no marked direction, and the
 first thing a wrong setting reaches is 60 LEDs and an ESP32. Meter on `OUT`, nothing
-else attached.
+else attached. **Measured here: 5.0 V.**
 
 #### The current budget
 
@@ -97,10 +97,12 @@ at all — and the answer is a different converter rather than a bigger heatsink
 
 #### One thing that is marginal on paper
 
-A WS2812's specified input threshold is 0.7 × V_DD. At a true 5.0 V that is **3.5 V**,
-and an ESP32-C3 pin drives 3.3 V — so the data line is nominally *below* spec. This is
-the standard reason a 5 V pixel ring on a 3.3 V controller works "mostly", with the
-occasional wrong pixel and no obvious cause.
+A WS2812's specified input threshold is 0.7 × V_DD. The rail here measures 5.0 V, which
+puts that threshold at **3.5 V**, and an ESP32-C3 pin drives 3.3 V — so the data line is
+nominally *below* spec. This is the standard reason a 5 V pixel ring on a 3.3 V
+controller works "mostly", with the occasional wrong pixel and no obvious cause. It is
+not a rounding-error miss: 5.0 V is the worst case for this margin, and any converter
+setting below it would improve matters.
 
 It works here, and the flicker this device used to show turned out to be a timing
 mismatch rather than a level problem (see [Power and heat](#power-and-heat)). Two
@@ -308,12 +310,15 @@ default clock, higher receive current — and no working die sensor to measure i
 | `Face type` | Select | `Normal`, `Simple`, `Gradient` |
 | `Indicator` | Select | `Off`, `12 o'clock`, `Quarters`, `Hour marks` |
 | `Enable seconds` | Switch | shows the second hand |
+| `Smooth hands` | Switch | hands slide as comets (on) or occupy one pixel each (off) |
 | `Color hour` / `Color minute` / `Color second` | Text | hex colour, e.g. `#FF0000` |
 | `Latitude` / `Longitude` | Text | decimal degrees, north and east positive — drives the `Sun` and `Moon` effects |
 | `Alarm Time` | Datetime | daily alarm, switches the ring to the `Alarm` effect |
 | `Set Clock` | Datetime | sets the clock by hand when nothing else can — see below |
 | `Alarm Enabled` | Switch | arms `Alarm Time` without losing the setting |
 | `Alarm Duration` | Number | minutes the alarm pulses before standing down, 1–10 |
+| `Hourly Effect` | Select | `Rainbow`, `Color Wipe`, `Fireworks`, `Twinkle` (default), `Random Twinkle` |
+| `Hourly Enabled` | Switch | arms the full-hour animation |
 | `MQTT` | Switch | brings the broker connection up or down — off after every boot |
 
 The alarm switches the ring on, selects the `Alarm` effect, and stands down by itself
@@ -330,6 +335,43 @@ running restarts the timer rather than queueing a second stand-down.
 
 The light's `on_turn_on` handler only normalises a switch-on that did not ask for a
 specific effect — otherwise it would override the alarm the instant it fired.
+
+### The full-hour animation
+
+With `Hourly Enabled` on, the ring runs `Hourly Effect` for **three seconds** at the top
+of every hour and then returns to the clock face. The trigger is a cron on the SNTP
+component — `0 0 * * * *`, i.e. second 0 of minute 0 — but it reads the *system* clock,
+so it works on a network-less boot where the DS1307 was what set that clock. `CronTrigger`
+checks `is_valid()` before firing, so an unsynced clock produces no burst at midnight.
+
+Three conditions have to hold, and all three exist to avoid surprising anyone:
+
+| Condition | Why |
+| --- | --- |
+| `Hourly Enabled` is on | the point of the feature |
+| the ring is on | a ring someone switched off stays off — it must not light the room once an hour, all night |
+| the clock face is showing | only `Time` gets interrupted |
+
+The last one does the most work. Anyone watching `Fire`, or a running alarm, or
+something picked by hand has said what they want on the ring, and taking it away for
+three seconds every hour would be a bug rather than a chime. It also removes any need to
+remember what to restore: **the only thing this can interrupt is the thing it returns
+to.**
+
+Unlike the alarm, the script sets neither brightness nor colour. The alarm goes to 100 %
+and then puts `DEFAULT_BRIGHTNESS` back, which is right for an alarm and would quietly
+undo a dimmed ring every hour on the hour here.
+
+Standing down uses the same guard the alarm does: it returns to the clock only if the
+animation is still what is showing, compared against the current `Hourly Effect`. Someone
+who reached for Home Assistant during those three seconds and picked something else has
+taken over.
+
+Three seconds is `HOURLY_DURATION` in the substitutions. Note that no transition length
+belongs anywhere near it: a light call carrying both an effect and a transition has the
+transition stripped and logs `effect cannot be used with transition/flash`, and a call
+carrying an effect never gets `default_transition_length` applied in the first place
+(`light_call.cpp`) — so the window really is the full three seconds, start to finish.
 
 Effects are set on the `LED color` light entity itself — Home Assistant lists them in
 its more-info dialog, and automations use `light.turn_on` with `effect:`. There is
@@ -404,10 +446,10 @@ given two.
 
 ### Hand movement
 
-Hands do not snap. Each one is drawn as a short comet sliding from its previous pixel
-to the current one over `HAND_FADE_MS`: the new pixel fades in, the old fades out, and
-a tail of dimming pixels follows behind. A second stepping from 10 to 11 looks like
-this, at the shipped 999 ms fade:
+With `Smooth hands` on — the default — hands do not snap. Each one is drawn as a short
+comet sliding from its previous pixel to the current one over `HAND_FADE_MS`: the new
+pixel fades in, the old fades out, and a tail of dimming pixels follows behind. A second
+stepping from 10 to 11 looks like this, at the shipped 999 ms fade:
 
 | t | pixel 8 | 9 | 10 | 11 |
 | --- | --- | --- | --- | --- |
@@ -435,6 +477,19 @@ above apply to the second hand as well as to the other two.
 **1000 is a hard ceiling.** The fade divides an age that resets every second by
 `HAND_FADE_MS`, so anything above 1000 never reaches full and leaves the second hand
 trailing its true pixel permanently.
+
+**Switching `Smooth hands` off** replaces all of it with one pixel per hand. That is the
+real trade the comet makes: at `HAND_TAIL: 3.0` a hand occupies three or four LEDs at
+once, which reads as motion but costs the ability to say precisely which minute the hand
+is on. With the switch off a hand is exactly its own pixel and steps cleanly, at the
+price of looking like a different display rather than a moving one — worth trying both
+before deciding which this clock is.
+
+The two branches agree on where a settled hand sits: the comet's head at full level
+blends to exactly the colour the single-pixel branch assigns, so the switch only ever
+adds or removes what trails behind. The step bookkeeping keeps running while the switch
+is off (three comparisons and three stores per frame), so the comets resume mid-stride
+when it goes back on instead of every hand lurching because its timestamp went stale.
 
 `Sun` simulates the sun in real time. It computes the solar elevation for the
 device's own coordinates and shows it directly: dark below the horizon, one pixel at
@@ -476,7 +531,8 @@ integration is correct without anyone typing anything.
 `entity_category` splits the entities by how often they are touched. The `Color …`
 entities, `Latitude`, `Longitude`, `Alarm Duration` and `MQTT` sit in Home Assistant's
 **configuration** category — set once and then left alone. `Face type`, `Indicator`,
-`Enable seconds`, `Alarm Time` and `Alarm Enabled` are plain **controls**: they are
+`Enable seconds`, `Smooth hands`, `Alarm Time`, `Alarm Enabled`, `Hourly Effect` and
+`Hourly Enabled` are plain **controls**: they are
 what you actually reach for, and burying them behind the configuration fold made the
 clock harder to use than it needed to be. `Brightness` is a **diagnostic** — it reports
 the room, nothing sets it.
@@ -543,9 +599,10 @@ showing whatever it was showing until the new firmware boots. See *Known limitat
 
 ## State that survives a reboot
 
-Twelve values persist: the three `Color …` entities, `Latitude` and `Longitude`,
-`Alarm Time`, `Alarm Duration` and `Alarm Enabled`, `Face type` and `Indicator`,
-`Enable seconds`, and the `Reset Count`. The `MQTT` switch is deliberately **not**
+Fifteen values persist: the three `Color …` entities, `Latitude` and `Longitude`,
+`Alarm Time`, `Alarm Duration` and `Alarm Enabled`, `Hourly Effect` and
+`Hourly Enabled`, `Face type` and `Indicator`, `Enable seconds`, `Smooth hands`, and the
+`Reset Count`. The `MQTT` switch is deliberately **not**
 among them — `ALWAYS_OFF` neither reads nor writes a preference.
 
 Their `restore_mode` / `restore_value` settings are spelled out in the YAML rather than
@@ -553,7 +610,11 @@ left to the schema defaults, which are `ALWAYS_OFF` and `false` — with the def
 every setting was silently lost on each restart. `initial_value` / `initial_option`
 therefore only apply on the very first boot, or after a factory reset.
 
-All twelve land in the same flash sector, which is why `preferences:` sets
+`Smooth hands` is the one switch on `RESTORE_DEFAULT_ON` rather than
+`RESTORE_DEFAULT_OFF`. Comet hands are how this clock has always looked, so a device
+that comes up without a stored preference has to come back looking the way it did.
+
+All fifteen land in the same flash sector, which is why `preferences:` sets
 `flash_write_interval: 5min` instead of the default 60 s: it folds a burst of
 slider-dragging in Home Assistant into one erase cycle. The cost either way is that a
 change made less than the interval before a power cut is lost.
@@ -589,6 +650,14 @@ The option **order** of `Face type` and `Indicator` is load-bearing (renaming is
 `restore_value` stores the index too): the `Time` effect
 switches on `active_index()`, so reordering or inserting an option silently remaps the
 face.
+
+`Hourly Effect` is the exact opposite, and the two rules are easy to mix up. Its
+**strings** are load-bearing and its order does not matter: the script passes the
+selected option straight to `light.turn_on`'s `effect:`, so an option that does not name
+a real effect is a silent no-op — `LightCall` logs `invalid effect index`, clears the
+flag and carries on, and the ring simply keeps showing the clock at every full hour with
+nothing to explain it. Rename an effect in the `light:` block and this select has to be
+renamed with it.
 
 ## Known limitations
 
