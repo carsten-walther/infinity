@@ -80,10 +80,12 @@ substitutions:
   # Brightness the clock comes back to on boot and on every switch-on. 60 LEDs
   # at full white draw around 3.6 A. That current never crosses the DevKit - the
   # ring hangs off the step-down converter's output in parallel with the board -
-  # but the USB brick feeding that converter cannot source it either, and there
-  # is no max_power here to stop anyone asking. 70% is far brighter than a room
-  # needs, and it is also inside what the supply can actually deliver. See "The
-  # 5 V supply" in README.md.
+  # but it is more than the MP1584 doing the 12V-to-5V conversion can deliver:
+  # that is a 3A part, and 3A is the die rating rather than what a module this
+  # size dissipates unheatsinked. There is no max_power here to stop anyone
+  # asking for it. 70% is far brighter than a room needs and keeps the ring near
+  # 1-2 A, which the whole chain carries with margin. See "The 5 V supply" in
+  # README.md.
   #
   DEFAULT_BRIGHTNESS: "70%"
 
@@ -357,6 +359,11 @@ esp32:
   # colour for one frame. Halving the clock halves the margin on that, on a
   # chip that is also servicing WiFi, the api, mqtt and a web server.
   #
+  # That is a reason to keep margin, not a diagnosis. The wrong-coloured pixels
+  # this device actually showed came from chipset: being set to WS2811 on a
+  # WS2812 strip - see the note at the light: block. This budget still stands,
+  # it just was not what was going wrong.
+  #
   # If the die runs hotter than wanted, take it out of power_save_mode or the
   # brightness, not out of this.
   cpu_frequency: 160MHZ
@@ -404,8 +411,8 @@ wifi:
   # with the first AP that answers for the SSID, which is what you want for a
   # hidden network and a liability on any other: with more than one access point
   # on the same SSID the device sticks to whoever replies first rather than to
-  # the strongest. At the -63 to -65 dBm this node sees, picking the better BSSID
-  # is worth the second or two the scan costs once per boot.
+  # the strongest. At the roughly -55 dBm this node sees, picking the better
+  # BSSID is worth the second or two the scan costs once per boot.
   #
   # Put it back to True if this SSID is hidden - fast_connect is the only way to
   # associate with one.
@@ -428,7 +435,8 @@ wifi:
   # itself never touches the network between SNTP syncs.
   #
   # HIGH would sleep through a longer listen interval. Not worth it: the delay
-  # reaches seconds and the link gets fragile at this RSSI (-63 to -65 dBm).
+  # reaches seconds, and this RSSI is not steady enough to spend margin on it -
+  # around -55 dBm typically, but -40 and -65 have both been read on this node.
   #
   # If OTA updates start failing, this is the first line to put back to NONE.
   power_save_mode: LIGHT
@@ -449,8 +457,8 @@ wifi:
 
   # Reduced from the ~20 dBm default. Barely moves the power budget - this node
   # transmits well under 0.1% of the time - but it does no harm either. Do not
-  # go lower: at this RSSI a weaker uplink means retransmits, and those cost
-  # more airtime than the lower power saves.
+  # go lower: at the RSSI noted above a weaker uplink means retransmits, and
+  # those cost more airtime than the lower power saves.
   output_power: 12dB
   ap:
     ssid: "${project_name}"
@@ -1921,6 +1929,14 @@ light:
     id: led_ring_id
     name: LED color
     icon: mdi:led-outline
+    # WS2812, not the WS2811 this was set to for a long time. The bit periods
+    # are close enough (1.39 vs 1.40 us) that the wrong one worked, which is
+    # why it survived so long - but WS2811 sends a 300 ns T0H against a
+    # WS2812B's 0.45 us upper bound for a zero bit, so there was almost no
+    # margin at the bottom, and a bit that tips there looks exactly like one
+    # stray pixel in the wrong colour. That was the flicker. The WS2812 entry
+    # also drops the 300 us reset WS2811 appends to every frame; the ~50 ms gap
+    # to the next frame latches on its own.
     chipset: WS2812
     rgb_order: GRB
     pin: ${PIN_LED}

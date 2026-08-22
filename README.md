@@ -16,7 +16,7 @@ The whole device — configuration and all C++ animations — lives in a single 
 | LED ring | 60× WS2812, GRB, on `GPIO10`, driven via RMT (`esp32_rmt_led_strip`) |
 | Brightness sensor | LDR divider on `GPIO01` (ADC1, 12 dB attenuation) |
 | RTC | DS1307 ("Tiny RTC") on i²c, address `0x68`, `GPIO06` = SDA, `GPIO07` = SCL, **powered from 3V3** |
-| Supply | USB power supply → MP1584EN adjustable step-down → ring and board in parallel |
+| Supply | 12 V power supply → MP1584EN step-down set to 5 V → ring and board in parallel |
 
 **The ring's current must never cross the DevKit.** 60 LEDs at full white draw around
 3.6 A, and even the normal clock face at 70 % brightness lights all 60 pixels for
@@ -37,14 +37,14 @@ for that reason.
 
 ### The 5 V supply
 
-A USB power supply feeds an **MP1584EN** adjustable step-down module, and the ring and
-the board hang off its output in parallel:
+A 12 V power supply feeds an **MP1584EN** adjustable step-down module set to 5 V, and
+the ring and the board hang off its output in parallel:
 
 ```
-USB PSU ──▶ IN+ ─┐                ┌─ OUT+ ──┬──▶ ESP32-C3  5V
-   (5 V)         │   MP1584EN     │         └──▶ LED ring  +
-        ──▶ IN− ─┘  (step-down)   └─ OUT− ──┬──▶ ESP32-C3  GND
-                                            └──▶ LED ring  −
+12 V PSU ──▶ IN+ ─┐                ┌─ OUT+ ──┬──▶ ESP32-C3  5V
+                  │   MP1584EN     │         └──▶ LED ring  +
+         ──▶ IN− ─┘   12 V → 5 V   └─ OUT− ──┬──▶ ESP32-C3  GND
+                                             └──▶ LED ring  −
 ```
 
 Photos: [`docs/Step-Down-MP1584-001.jpg`](docs/Step-Down-MP1584-001.jpg) (top),
@@ -54,55 +54,66 @@ arrow pointing from in to out. On top sit the MP1584EN in SOIC-8, a 4.7 µH indu
 (`4R7`), an `SS34` Schottky and the trimmer that sets the output voltage. The MP1584 is
 a **non-synchronous** buck: it integrates the high-side switch only, which is why the
 catch diode is a discrete part on the board instead of a second MOSFET inside the chip.
+That matters for where the heat ends up — see below.
 
 **Set the output before the load is connected.** These modules ship at whatever the
 trimmer was last left at, the trimmer is multiturn with no marked direction, and the
 first thing a wrong setting reaches is 60 LEDs and an ESP32. Meter on `OUT`, nothing
 else attached.
 
-#### What running it from 5 V costs, and what it buys
+#### The current budget
 
-**It cannot actually produce 5 V.** A buck converter steps *down* — it has no mechanism
-for reaching its own input voltage, and the MP1584 in particular drives its high-side
-switch from a bootstrap capacitor that needs the switch node pulled low periodically to
-recharge, so 100 % duty cycle is not merely inefficient but unreachable. Its specified
-minimum input is 4.5 V. Fed from a 5 V USB supply, the output is necessarily *below*
-5 V, by an amount set by the trimmer and by how far the supply sags under load.
+12 V in and 5 V out is a real conversion ratio, so the converter trades voltage for
+current and the input side is comfortable. Reckoning with roughly 85 % efficiency:
 
-For the ring that is mostly good news. A WS2812's logic threshold is 0.7 × V_DD: at a
-true 5.0 V that is **3.5 V**, which an ESP32-C3 pin driving 3.3 V never reaches — the
-standard reason a WS2812 ring on a 3.3 V controller works "mostly", with an
-occasional wrong pixel and no obvious cause. At 4.4 V the threshold falls to 3.08 V and
-the data line has real margin, so the converter is quietly doing a level shifter's job.
-Do not chase those millivolts back: below roughly 4 V the blue die runs out of
-forward-voltage headroom before red and green do, and flat white drifts warm.
+| Ring state | Ring current at 5 V | Power | Drawn from the 12 V supply |
+| --- | --- | --- | --- |
+| Clock face at 70 % (normal operation) | 1–2 A | 5–10 W | 0.5–1.0 A |
+| Full white at 100 % | 3.6 A | 18 W | ≈ 1.8 A |
 
-**The current budget is set by the USB supply, not by the module.** With input and
-output nearly equal there is no voltage ratio to trade, and therefore no current gain
-either — the supply has to source very nearly the whole ring current, plus the board:
+A 12 V/2 A brick therefore covers even full white. **The converter does not.** The
+MP1584 is a 3 A part, and 3 A is the die rating rather than what a module this size
+dissipates without a heatsink or a copper pour — so full white asks 3.6 A of a component
+that runs out somewhere below 3 A.
 
-| Ring state | Ring current | Drawn from the USB supply |
+Nothing in `infinity.yaml` prevents asking: there is no `max_power`, so the light can be
+set to 100 % white. At the default 70 % on the clock face the ring stays near 1–2 A and
+everything in the chain is inside its rating with margin, which is where this is meant
+to run.
+
+Because the converter is non-synchronous, the losses land mostly in the **`SS34`**, not
+in the chip. At a duty cycle of (5 + 0.5)/(12 + 0.5) ≈ 0.44 the diode carries the output
+current for the other 56 % of every cycle, at ~0.5 V forward:
+
+| Ring current | `SS34` | MP1584 switch (≈ 100 mΩ) |
 | --- | --- | --- |
-| Clock face at 70 % (normal operation) | 1–2 A | 1–2 A |
-| Full white at 100 % | 3.6 A | ≈ 3.7 A, i.e. 18 W |
+| 2 A | ≈ 0.56 W | ≈ 0.18 W |
+| 3.6 A | ≈ 1.0 W | ≈ 0.57 W |
 
-A typical USB supply stops at 2.4 A, and this module — 3 A at the chip, considerably
-less on a board this size with no heatsinking — stops short of full white as well.
-Nothing in `infinity.yaml` prevents asking for it: there is no `max_power`, so setting
-the light to 100 % white requests a current that no part of this chain can deliver. The
-rail sags, and a sagging rail produces exactly the brief wrong-coloured pixels described
-under [Power and heat](#power-and-heat). If the ring ever has to run bright, the fix
-belongs at the supply and not in the firmware.
+The `SS34` is an SMA-package part on a small board. Around half a watt it is warm; near
+a watt it is the component that decides how long this runs. If the module ever needs to
+deliver more, that diode is the thing to fix — a synchronous module has no catch diode
+at all — and the answer is a different converter rather than a bigger heatsink.
 
-The losses at this operating point are the opposite of the usual ones: duty cycle sits
-near 100 %, so the internal switch (≈ 100 mΩ) is conducting almost permanently and
-dissipates I²R rather than switching loss — about 0.4 W at 2 A — while the `SS34` barely
-conducts at all. The hot spot is the chip, not the diode.
+#### One thing that is marginal on paper
 
-**If this is ever rebuilt, feed the converter from 9–12 V instead.** Then it works the
-way a buck is supposed to: 2 A out at 5 V costs only about 0.9 A in at 12 V, the input
-side stops being the bottleneck, and the output no longer tracks a sagging 5 V rail. The
-trade is that the `SS34` then carries real current and becomes the part that gets warm.
+A WS2812's specified input threshold is 0.7 × V_DD. At a true 5.0 V that is **3.5 V**,
+and an ESP32-C3 pin drives 3.3 V — so the data line is nominally *below* spec. This is
+the standard reason a 5 V pixel ring on a 3.3 V controller works "mostly", with the
+occasional wrong pixel and no obvious cause.
+
+It works here, and the flicker this device used to show turned out to be a timing
+mismatch rather than a level problem (see [Power and heat](#power-and-heat)). Two
+details make the margin less alarming than the numbers suggest: real WS2812Bs switch
+well below the specified threshold, and only the **first** pixel ever sees the 3.3 V
+signal — every pixel after it is driven by its predecessor's reshaped 5 V output. So a
+level failure would not look like scattered wrong pixels; it would take out the whole
+ring at once, because pixel 1 misread the frame everyone else is fed from.
+
+Worth knowing rather than worth fixing. If that symptom ever appears, the cheapest
+remedy is the trimmer: dropping the rail to 4.5 V puts the threshold at 3.15 V and buys
+real margin, at the cost of a little headroom on the blue die. Below roughly 4 V blue
+runs out of forward voltage before red and green do, and flat white drifts warm.
 
 ### Choosing pins on the ESP32-C3
 
@@ -267,10 +278,21 @@ colour for one frame, on a chip that is also servicing WiFi, the API, MQTT and a
 server. If the die runs hotter than wanted, take it out of `power_save_mode` or the
 brightness setting rather than out of the clock.
 
+That is an argument for keeping margin, not a diagnosis. This device *did* show brief
+wrong-coloured pixels for a while, and an RMT underrun was the standing theory — but the
+cause turned out to be simpler: the strip is WS2812 and `chipset:` was set to `WS2811`.
+The bit periods are near enough (1.39 vs 1.40 µs) that it worked, but `WS2811` sends a
+300 ns `T0H` against a WS2812B's 0.45 µs upper bound for a zero, leaving almost no
+margin at the bottom — and a bit that tips there looks exactly like a stray pixel.
+Correcting the chipset fixed it. The underrun budget above is real and still the reason
+the clock stays at 160 MHz; it just was not what was happening here.
+
 `output_power: 12dB` is a reduction from the ~20 dBm default, but it barely matters —
-this node transmits well under 0.1 % of the time. Do not go lower: at the measured
-RSSI of −63 to −65 dBm a weaker uplink causes retransmits, which cost more airtime
-than the lower power saves.
+this node transmits well under 0.1 % of the time. Do not go lower: a weaker uplink
+causes retransmits, which cost more airtime than the lower power saves. RSSI here sits
+around **−55 dBm**, though it is not steady — −40 and −65 have both been read on this
+node — and that spread is also why `power_save_mode` stays at `LIGHT` rather than
+`HIGH`.
 
 Note the ESP32-WROOM-32 would run *hotter*, not cooler: two Xtensa cores, a 240 MHz
 default clock, higher receive current — and no working die sensor to measure it with.
